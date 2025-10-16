@@ -10,6 +10,7 @@ The script will create a directory `prebaked_content/<preset_slug>/` containing:
 
 It reuses the helper functions from app.py to stay consistent with runtime logic.
 """
+
 from __future__ import annotations
 
 import json
@@ -18,9 +19,14 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from app import DEFAULT_SECONDS, generate_scene_video, plan_initial_scene, plan_next_scene  # type: ignore
+from app import (
+    DEFAULT_SECONDS,
+    generate_scene_video,
+    plan_initial_scene,
+    plan_next_scene,
+)  # type: ignore
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -84,7 +90,9 @@ def slug_path(path: List[int]) -> str:
     return "scene_" + "_".join(str(idx) for idx in path)
 
 
-def copy_assets(video_path: Path, frame_path: Path, target_dir: Path, slug: str) -> (str, str):
+def copy_assets(
+    video_path: Path, frame_path: Path, target_dir: Path, slug: str
+) -> Tuple[str, str]:
     target_dir.mkdir(parents=True, exist_ok=True)
     target_video = target_dir / f"{slug}.mp4"
     target_poster = target_dir / f"{slug}.jpg"
@@ -105,7 +113,12 @@ class ProgressHandle:
     def __post_init__(self) -> None:
         self.use_tqdm = self.use_tqdm and (tqdm is not None)
         if self.use_tqdm:
-            self._bar = tqdm(total=self.total, desc=self.desc, position=self.position, leave=(self.position == 0))
+            self._bar = tqdm(
+                total=self.total,
+                desc=self.desc,
+                position=self.position,
+                leave=(self.position == 0),
+            )
         else:
             self.current = 0
 
@@ -120,7 +133,9 @@ class ProgressHandle:
             bar_len = 28
             filled = int(bar_len * pct)
             bar = "#" * filled + "-" * (bar_len - filled)
-            msg = f"{self.desc}: [{bar}] {pct*100:5.1f}% ({self.current}/{self.total})"
+            msg = (
+                f"{self.desc}: [{bar}] {pct * 100:5.1f}% ({self.current}/{self.total})"
+            )
             if detail:
                 msg += f" {detail}"
             print(msg)
@@ -146,7 +161,9 @@ def build_tree(
     depth: int,
 ) -> SceneNode:
     if depth == 0:
-        scene = plan_initial_scene(api_key=api_key, base_prompt=base_prompt, model=planner_model)
+        scene = plan_initial_scene(
+            api_key=api_key, base_prompt=base_prompt, model=planner_model
+        )
     else:
         scene = plan_next_scene(
             api_key=api_key,
@@ -173,10 +190,14 @@ def build_tree(
         )
         # copy into preset directory
         preset_dir = OUTPUT_ROOT / preset_slug
-        video_relpath, poster_relpath = copy_assets(video_path, frame_path, preset_dir, node_slug)
+        video_relpath, poster_relpath = copy_assets(
+            video_path, frame_path, preset_dir, node_slug
+        )
         last_frame_path = frame_path
     else:
-        print(f"  ⚠️ planner missing prompt at slug={node_slug}; skipping video generation")
+        print(
+            f"  ⚠️ planner missing prompt at slug={node_slug}; skipping video generation"
+        )
 
     node = SceneNode(
         path=list(path),
@@ -209,7 +230,9 @@ def build_tree(
             )
             node.children.append(child)
 
-    detail = node_slug if trigger_choice is None else f"{node_slug} <- {trigger_choice[:24]}"
+    detail = (
+        node_slug if trigger_choice is None else f"{node_slug} <- {trigger_choice[:24]}"
+    )
     preset_tracker.advance(detail)
     overall_detail = f"{preset_slug}:{detail}" if overall_tracker.use_tqdm else ""
     overall_tracker.advance(overall_detail)
@@ -227,15 +250,19 @@ def main() -> None:
     sora_model = os.environ.get("SORA_MODEL", "sora-2")
     video_size = os.environ.get("VIDEO_SIZE", "1280x720")
 
-    nodes_per_preset = sum(3 ** depth for depth in range(MAX_DEPTH + 1))
-    overall_tracker = ProgressHandle(total=nodes_per_preset * len(PRESETS), desc="Overall", position=0)
+    nodes_per_preset = sum(3**depth for depth in range(MAX_DEPTH + 1))
+    overall_tracker = ProgressHandle(
+        total=nodes_per_preset * len(PRESETS), desc="Overall", position=0
+    )
 
     for idx, (preset_slug, base_prompt) in enumerate(PRESETS.items()):
         print(f"\n=== Generating preset '{preset_slug}' ===")
         preset_dir = OUTPUT_ROOT / preset_slug
         preset_dir.mkdir(parents=True, exist_ok=True)
 
-        preset_tracker = ProgressHandle(total=nodes_per_preset, desc=preset_slug, position=idx + 1)
+        preset_tracker = ProgressHandle(
+            total=nodes_per_preset, desc=preset_slug, position=idx + 1
+        )
 
         tree = build_tree(
             api_key=api_key,

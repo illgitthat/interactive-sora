@@ -1,13 +1,12 @@
 import json
 import mimetypes
-import os
 import re
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import requests
@@ -72,7 +71,7 @@ Rules:
    - Maintain consistent characters, setting, tone, camera language, and lighting unless the choice implies a justified shift.
    - Ensure smooth shot-to-shot transitions (same time of day, matching positions/poses as appropriate).
 
-4) Choices:
+4) Choices
    - Provide exactly three distinct options for what the player can do next.
    - Make each option feasible in the next short shot, and clearly different in intent.
    - Keep each choice concise (<= 22 words).
@@ -166,7 +165,9 @@ def _auth_headers(api_key: str) -> Dict[str, str]:
     }
 
 
-def responses_create(api_key: str, model: str, instructions: str, user_input: str) -> str:
+def responses_create(
+    api_key: str, model: str, instructions: str, user_input: str
+) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -176,9 +177,13 @@ def responses_create(api_key: str, model: str, instructions: str, user_input: st
         "instructions": instructions,
         "input": user_input,
     }
-    response = requests.post(RESPONSES_ENDPOINT, headers=headers, json=payload, timeout=120)
+    response = requests.post(
+        RESPONSES_ENDPOINT, headers=headers, json=payload, timeout=120
+    )
     if response.status_code >= 400:
-        raise RuntimeError(f"Responses API error {response.status_code}: {response.text}")
+        raise RuntimeError(
+            f"Responses API error {response.status_code}: {response.text}"
+        )
     data = response.json()
 
     text = data.get("output_text", "")
@@ -196,7 +201,10 @@ def responses_create(api_key: str, model: str, instructions: str, user_input: st
                     builder.append(block.get("text", ""))
                 elif isinstance(block.get("text"), list):
                     for segment in block["text"]:
-                        if isinstance(segment, dict) and segment.get("type") in {"output_text", "text"}:
+                        if isinstance(segment, dict) and segment.get("type") in {
+                            "output_text",
+                            "text",
+                        }:
                             builder.append(segment.get("text", ""))
         if builder:
             return "".join(builder)
@@ -255,7 +263,9 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
         parts = [str(item).strip() for item in scenario_display if str(item).strip()]
         scenario_display = " ".join(parts)
     if not scenario_display:
-        scenario_display = "Planner response missing scene description. Adjust your prompt and retry."
+        scenario_display = (
+            "Planner response missing scene description. Adjust your prompt and retry."
+        )
 
     sora_prompt_raw = _pick(sora_prompt_keys)
     sora_prompt_missing = False
@@ -275,28 +285,38 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
             sora_prompt_value = "\n".join(lines).strip()
         else:
             sora_prompt_missing = True
-            sora_prompt_missing_reason = "Planner returned prompt dict but it had no usable values."
+            sora_prompt_missing_reason = (
+                "Planner returned prompt dict but it had no usable values."
+            )
             sora_prompt_value = ""
     elif isinstance(sora_prompt_value, list):
-        joined = "\n".join(str(item).strip() for item in sora_prompt_value if str(item).strip())
+        joined = "\n".join(
+            str(item).strip() for item in sora_prompt_value if str(item).strip()
+        )
         if joined:
             sora_prompt_value = joined
         else:
             sora_prompt_missing = True
-            sora_prompt_missing_reason = "Planner returned prompt list but all entries were empty."
+            sora_prompt_missing_reason = (
+                "Planner returned prompt list but all entries were empty."
+            )
             sora_prompt_value = ""
 
     if sora_prompt_value is None:
         sora_prompt_missing = True
         if not sora_prompt_missing_reason:
-            sora_prompt_missing_reason = "Planner response missing recognized Sora prompt field."
+            sora_prompt_missing_reason = (
+                "Planner response missing recognized Sora prompt field."
+            )
         sora_prompt_value = ""
     elif not isinstance(sora_prompt_value, str):
         sora_prompt_value = str(sora_prompt_value).strip()
         if not sora_prompt_value:
             sora_prompt_missing = True
             if not sora_prompt_missing_reason:
-                sora_prompt_missing_reason = "Planner returned non-string prompt that was empty after casting."
+                sora_prompt_missing_reason = (
+                    "Planner returned non-string prompt that was empty after casting."
+                )
     else:
         sora_prompt_value = sora_prompt_value.strip()
         if not sora_prompt_value:
@@ -319,7 +339,9 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
         choices = [frag.strip(" •-\t").strip() for frag in fragments if frag.strip()]
 
     while len(choices) < 3:
-        choices.append(f"Missing choice {len(choices) + 1}. Update prompt and regenerate.")
+        choices.append(
+            f"Missing choice {len(choices) + 1}. Update prompt and regenerate."
+        )
     if len(choices) > 3:
         choices = choices[:3]
 
@@ -342,7 +364,9 @@ BASE PROMPT:
 Shot length: 8 seconds.
 Return JSON with keys: scenario_display, sora_prompt, choices (3).
 """.strip()
-    raw = responses_create(api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input)
+    raw = responses_create(
+        api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input
+    )
     scene = normalize_scene_payload(extract_first_json(raw))
     scene["_raw_planner_output"] = raw.strip()
     scene["_planner_model"] = model
@@ -375,7 +399,9 @@ preserving continuity (subjects, camera position, lighting, motion direction), u
 
 Return JSON with keys: scenario_display, sora_prompt, choices (3).
 """.strip()
-    raw = responses_create(api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input)
+    raw = responses_create(
+        api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input
+    )
     scene = normalize_scene_payload(extract_first_json(raw))
     scene["_raw_planner_output"] = raw.strip()
     scene["_planner_model"] = model
@@ -408,9 +434,13 @@ def sora_create_video(
             open(input_reference_path, "rb"),  # noqa: SIM115 - leave open for requests to stream
             _guess_mime(input_reference_path),
         )
-    response = requests.post(SORA_VIDEOS_ENDPOINT, headers=_auth_headers(api_key), files=files, timeout=600)
+    response = requests.post(
+        SORA_VIDEOS_ENDPOINT, headers=_auth_headers(api_key), files=files, timeout=600
+    )
     if response.status_code >= 400:
-        raise RuntimeError(f"Sora create failed ({response.status_code}): {response.text}")
+        raise RuntimeError(
+            f"Sora create failed ({response.status_code}): {response.text}"
+        )
     return response.json()
 
 
@@ -422,29 +452,35 @@ def sora_retrieve_video(api_key: str, video_id: str) -> dict:
             response = requests.get(url, headers=_auth_headers(api_key), timeout=120)
         except requests.RequestException as exc:
             last_error = exc
-            time.sleep(min(2 ** attempt, 8))
+            time.sleep(min(2**attempt, 8))
             continue
 
         if response.status_code >= 500 or response.status_code in (429, 520):
-            last_error = RuntimeError(f"Sora retrieve failed ({response.status_code}): {response.text[:200]}")
-            time.sleep(min(2 ** attempt, 8))
+            last_error = RuntimeError(
+                f"Sora retrieve failed ({response.status_code}): {response.text[:200]}"
+            )
+            time.sleep(min(2**attempt, 8))
             continue
 
         if response.status_code >= 400:
-            raise RuntimeError(f"Sora retrieve failed ({response.status_code}): {response.text}")
+            raise RuntimeError(
+                f"Sora retrieve failed ({response.status_code}): {response.text}"
+            )
 
         try:
             return response.json()
         except ValueError as exc:
             last_error = exc
-            time.sleep(min(2 ** attempt, 8))
+            time.sleep(min(2**attempt, 8))
 
     if last_error:
         raise RuntimeError(f"Sora retrieve failed after retries: {last_error}")
     raise RuntimeError("Sora retrieve failed after retries: unknown error")
 
 
-def sora_download_content(api_key: str, video_id: str, out_path: Path, variant: str = "video") -> Path:
+def sora_download_content(
+    api_key: str, video_id: str, out_path: Path, variant: str = "video"
+) -> Path:
     url = f"{SORA_VIDEOS_ENDPOINT}/{video_id}/content"
     with requests.get(
         url,
@@ -454,7 +490,9 @@ def sora_download_content(api_key: str, video_id: str, out_path: Path, variant: 
         timeout=1800,
     ) as response:
         if response.status_code >= 400:
-            raise RuntimeError(f"Sora download failed ({response.status_code}): {response.text}")
+            raise RuntimeError(
+                f"Sora download failed ({response.status_code}): {response.text}"
+            )
         with open(out_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
@@ -514,7 +552,9 @@ def extract_last_frame(video_path: Path, out_image_path: Path) -> Path:
         if out_image_path.exists():
             return out_image_path
 
-    raise RuntimeError("Failed to extract last frame: OpenCV/FFmpeg unavailable or video unreadable.")
+    raise RuntimeError(
+        "Failed to extract last frame: OpenCV/FFmpeg unavailable or video unreadable."
+    )
 
 
 def normalize_seconds(secs: int) -> int:
@@ -528,7 +568,7 @@ def generate_scene_video(
     size: str,
     seconds: int,
     input_reference: Optional[Path],
-) -> (str, Path, Path):
+) -> Tuple[str, Path, Path]:
     seconds = normalize_seconds(seconds)
     job = sora_create_video(
         api_key=api_key,
@@ -560,7 +600,9 @@ def create_story_item(scene: Dict[str, Any]) -> Dict[str, Any]:
         "video_path": None,
         "last_frame_path": None,
         "planner_missing_prompt": scene.get("_planner_missing_prompt", False),
-        "planner_missing_prompt_reason": scene.get("_planner_missing_prompt_reason", ""),
+        "planner_missing_prompt_reason": scene.get(
+            "_planner_missing_prompt_reason", ""
+        ),
         "planner_raw_output": scene.get("_raw_planner_output", ""),
         "planner_model": scene.get("_planner_model", ""),
         "planner_stage": scene.get("_planner_stage", ""),
@@ -589,7 +631,9 @@ def build_story_payload(story: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "posterUrl": poster_url,
                 "videoId": step.get("video_id"),
                 "plannerMissingPrompt": step.get("planner_missing_prompt", False),
-                "plannerMissingPromptReason": step.get("planner_missing_prompt_reason", ""),
+                "plannerMissingPromptReason": step.get(
+                    "planner_missing_prompt_reason", ""
+                ),
             }
         )
     return payload
@@ -695,11 +739,15 @@ def advance_story(session_id: str, payload: ChoiceRequest) -> SessionResponse:
     state = get_session_or_404(session_id)
     with state.lock:
         if not state.story:
-            raise HTTPException(status_code=400, detail="Session has not been initialized")
+            raise HTTPException(
+                status_code=400, detail="Session has not been initialized"
+            )
 
         current = state.story[-1]
         if current.get("choice_index") is not None:
-            raise HTTPException(status_code=400, detail="Current scene already has a recorded choice")
+            raise HTTPException(
+                status_code=400, detail="Current scene already has a recorded choice"
+            )
 
         current["choice_index"] = payload.choice_index
         chosen_choice = current["choices"][payload.choice_index]
