@@ -5,6 +5,7 @@ import os
 import subprocess
 import threading
 import time
+from urllib.parse import urlencode
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,9 +40,16 @@ DEFAULT_VIDEO_SIZE = "1280x720"
 DEFAULT_SECONDS = 8
 ALLOWED_SECONDS = [4, 8, 12]
 
-OPENAI_API_BASE = os.getenv("AZURE_OPENAI_API_BASE")  # "https://api.openai.com/v1"
-SORA_VIDEOS_ENDPOINT = f"{OPENAI_API_BASE}/videos"
-RESPONSES_ENDPOINT = f"{OPENAI_API_BASE}/responses"
+AZURE_API_BASE = os.getenv("AZURE_OPENAI_API_BASE", "").rstrip("/")
+AZURE_RESPONSES_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "preview").strip()
+AZURE_VIDEO_API_VERSION = os.getenv(
+    "AZURE_OPENAI_VIDEO_API_VERSION", AZURE_RESPONSES_API_VERSION or "preview"
+).strip()
+DEFAULT_PLANNER_DEPLOYMENT = (
+    os.getenv("AZURE_OPENAI_CHAT_MODEL", "gpt-5-chat").strip() or "gpt-5-chat"
+)
+DEFAULT_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+DEFAULT_SORA_MODEL = os.getenv("AZURE_OPENAI_SORA_MODEL", "sora-2").strip() or "sora-2"
 
 PLANNER_SYSTEM = """
 You are the Scenario Planner for a Sora-powered choose-your-own-adventure game.
@@ -158,34 +166,69 @@ app.mount("/media/videos", StaticFiles(directory=str(VIDEO_DIR)), name="videos")
 app.mount("/media/frames", StaticFiles(directory=str(FRAME_DIR)), name="frames")
 
 
-def _auth_headers(api_key: str) -> Dict[str, str]:
+def _api_headers(api_key: str, *, content_type: Optional[str] = None) -> Dict[str, str]:
     if not api_key:
-        raise RuntimeError("OpenAI API key is required")
-    return {
-        "Authorization": f"Bearer {api_key}",
+        raise RuntimeError("Azure OpenAI API key is required")
+    headers: Dict[str, str] = {
+        "api-key": api_key,
     }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
 
 
 def responses_create(
     api_key: str, model: str, instructions: str, user_input: str
 ) -> str:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    if not AZURE_API_BASE:
+        raise RuntimeError("AZURE_OPENAI_API_BASE must be configured")
+
+    deployment = (model or DEFAULT_PLANNER_DEPLOYMENT).strip()
+    if not deployment:
+        raise RuntimeError("Planner model/deployment must be provided")
+
+    candidate_versions = []
+    configured_version = (AZURE_RESPONSES_API_VERSION or "preview").strip()
+    if configured_version:
+        candidate_versions.append(configured_version)
+    if "preview" not in [version.lower() for version in candidate_versions]:
+        candidate_versions.append("preview")
+
+    headers = _api_headers(api_key, content_type="application/json")
     payload = {
-        "model": model,
+        "model": deployment,
         "instructions": instructions,
         "input": user_input,
     }
-    response = requests.post(
-        RESPONSES_ENDPOINT, headers=headers, json=payload, timeout=120
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Responses API error {response.status_code}: {response.text}"
-        )
-    data = response.json()
+
+    last_error: Optional[Exception] = None
+    last_response: Optional[requests.Response] = None
+    for version in candidate_versions:
+        url = f"{AZURE_API_BASE}/openai/v1/responses?api-version={version}"
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
+        if response.status_code < 400:
+            last_response = response
+            break
+
+        error_text = response.text
+        if (
+            response.status_code == 400
+            and "api version not supported" in error_text.lower()
+            and version.lower() != "preview"
+        ):
+            last_error = RuntimeError(
+                f"Responses API error {response.status_code}: {error_text}"
+            )
+            continue
+
+        raise RuntimeError(f"Responses API error {response.status_code}: {error_text}")
+
+    if last_response is None:
+        if last_error:
+            raise last_error
+        raise RuntimeError("Responses API call failed without a successful attempt")
+
+    data = last_response.json()
 
     text = data.get("output_text", "")
     if text:
@@ -415,6 +458,42 @@ def _guess_mime(path: Path) -> str:
     return mime or "application/octet-stream"
 
 
+def _video_dimensions(size: str) -> Tuple[int, int]:
+    try:
+        width_str, height_str = size.lower().split("x", 1)
+        width = int(width_str)
+        height = int(height_str)
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        pass
+    fallback_width, fallback_height = [
+        int(val) for val in DEFAULT_VIDEO_SIZE.split("x")
+    ]
+    return fallback_width, fallback_height
+
+
+def _video_jobs_url(
+    *,
+    job_id: Optional[str] = None,
+    suffix: Optional[str] = None,
+    params: Optional[Dict[str, str]] = None,
+) -> str:
+    if not AZURE_API_BASE:
+        raise RuntimeError("AZURE_OPENAI_API_BASE must be configured")
+
+    base = f"{AZURE_API_BASE}/openai/v1/video/generations/jobs"
+    if job_id:
+        base = f"{base}/{job_id}"
+    if suffix:
+        base = f"{base}/{suffix}"
+
+    query: Dict[str, str] = {"api-version": AZURE_VIDEO_API_VERSION or "preview"}
+    if params:
+        query.update(params)
+    return f"{base}?{urlencode(query)}"
+
+
 def sora_create_video(
     api_key: str,
     sora_prompt: str,
@@ -423,20 +502,23 @@ def sora_create_video(
     seconds: int,
     input_reference_path: Optional[Path] = None,
 ) -> dict:
-    files = {
-        "model": (None, model),
-        "prompt": (None, sora_prompt),
-        "size": (None, size),
-        "seconds": (None, str(seconds)),
+    width, height = _video_dimensions(size)
+    payload: Dict[str, Any] = {
+        "prompt": sora_prompt,
+        "model": model,
+        "n_variants": 1,
+        "n_seconds": seconds,
+        "width": width,
+        "height": height,
     }
-    if input_reference_path:
-        files["input_reference"] = (
-            input_reference_path.name,
-            open(input_reference_path, "rb"),  # noqa: SIM115 - leave open for requests to stream
-            _guess_mime(input_reference_path),
-        )
+
+    # Azure video preview currently expects JSON payloads; input reference continuity is handled in prompt context.
+
     response = requests.post(
-        SORA_VIDEOS_ENDPOINT, headers=_auth_headers(api_key), files=files, timeout=600
+        _video_jobs_url(),
+        headers=_api_headers(api_key, content_type="application/json"),
+        json=payload,
+        timeout=600,
     )
     if response.status_code >= 400:
         raise RuntimeError(
@@ -446,11 +528,11 @@ def sora_create_video(
 
 
 def sora_retrieve_video(api_key: str, video_id: str) -> dict:
-    url = f"{SORA_VIDEOS_ENDPOINT}/{video_id}"
+    url = _video_jobs_url(job_id=video_id)
     last_error: Optional[Exception] = None
     for attempt in range(5):
         try:
-            response = requests.get(url, headers=_auth_headers(api_key), timeout=120)
+            response = requests.get(url, headers=_api_headers(api_key), timeout=120)
         except requests.RequestException as exc:
             last_error = exc
             time.sleep(min(2**attempt, 8))
@@ -482,11 +564,12 @@ def sora_retrieve_video(api_key: str, video_id: str) -> dict:
 def sora_download_content(
     api_key: str, video_id: str, out_path: Path, variant: str = "video"
 ) -> Path:
-    url = f"{SORA_VIDEOS_ENDPOINT}/{video_id}/content"
+    url = _video_jobs_url(
+        job_id=video_id, suffix="content", params={"variant": variant}
+    )
     with requests.get(
         url,
-        headers=_auth_headers(api_key),
-        params={"variant": variant},
+        headers=_api_headers(api_key),
         stream=True,
         timeout=1800,
     ) as response:
@@ -664,12 +747,25 @@ def healthcheck() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/default-config")
+def default_config() -> Dict[str, Any]:
+    return {
+        "apiKey": DEFAULT_API_KEY,
+        "plannerModel": DEFAULT_PLANNER_DEPLOYMENT,
+        "soraModel": DEFAULT_SORA_MODEL,
+        "videoSize": DEFAULT_VIDEO_SIZE,
+        "maxSteps": 10,
+    }
+
+
 @app.post("/api/session", response_model=SessionResponse)
 def create_session(payload: CreateSessionRequest) -> SessionResponse:
     config = SessionConfig(
-        api_key=payload.api_key.strip(),
-        planner_model=payload.planner_model.strip() or "gpt-5",
-        sora_model=payload.sora_model.strip() or "sora-2",
+        api_key=(payload.api_key or DEFAULT_API_KEY).strip(),
+        planner_model=(payload.planner_model or DEFAULT_PLANNER_DEPLOYMENT).strip()
+        or DEFAULT_PLANNER_DEPLOYMENT,
+        sora_model=(payload.sora_model or DEFAULT_SORA_MODEL).strip()
+        or DEFAULT_SORA_MODEL,
         video_size=payload.video_size.strip() or DEFAULT_VIDEO_SIZE,
         base_prompt=payload.base_prompt.strip(),
         max_steps=payload.max_steps,

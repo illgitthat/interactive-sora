@@ -19,10 +19,10 @@ const PRESETS = [
   },
 ];
 
-const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl }) => {
+const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig }) => {
   const [form, setForm] = useState({
     apiKey: "",
-    plannerModel: "gpt-5",
+    plannerModel: "gpt-5-chat",
     soraModel: "sora-2",
     videoSize: "1280x720",
     basePrompt:
@@ -36,6 +36,17 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl }) => {
       setForm((prev) => ({ ...prev, apiKey: storedKey }));
     }
   }, []);
+
+  useEffect(() => {
+    if (!defaultConfig) return;
+    setForm((prev) => ({
+      ...prev,
+      apiKey: prev.apiKey || defaultConfig.apiKey || "",
+      plannerModel: prev.plannerModel || defaultConfig.plannerModel || "gpt-5-chat",
+      soraModel: prev.soraModel || defaultConfig.soraModel || "sora-2",
+      videoSize: prev.videoSize || defaultConfig.videoSize || "1280x720",
+    }));
+  }, [defaultConfig]);
 
   const maskedKey = useMemo(() => {
     if (!form.apiKey) return "";

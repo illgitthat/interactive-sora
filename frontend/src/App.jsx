@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import ConfigScreen from "./components/ConfigScreen.jsx";
 import ExperienceScreen from "./components/ExperienceScreen.jsx";
@@ -20,6 +20,21 @@ const App = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [globalError, setGlobalError] = useState(null);
   const [configSnapshot, setConfigSnapshot] = useState(null);
+  const [defaultConfig, setDefaultConfig] = useState(null);
+
+  useEffect(() => {
+    const fetchDefaults = async () => {
+      try {
+        const { data } = await api.get("/api/default-config");
+        setDefaultConfig(data);
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn("Failed to load default config", error);
+      }
+    };
+
+    fetchDefaults();
+  }, []);
 
   const handleConfigSubmit = async (config) => {
     setIsSubmitting(true);
@@ -88,6 +103,7 @@ const App = () => {
       isSubmitting={isSubmitting}
       error={globalError}
       apiBaseUrl={API_BASE_URL}
+      defaultConfig={defaultConfig}
     />
   ) : (
     <ExperienceScreen

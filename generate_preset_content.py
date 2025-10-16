@@ -1,7 +1,7 @@
 """Utility script to pre-generate cinematic starter trees for the three default presets.
 
 Usage:
-    OPENAI_API_KEY=sk-... python generate_preset_content.py
+    AZURE_OPENAI_API_KEY=... python generate_preset_content.py
 
 The script will create a directory `prebaked_content/<preset_slug>/` containing:
     - mp4 videos for depth-0 to depth-2 scenes (13 clips per preset)
@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from app import (
+    DEFAULT_API_KEY,
+    DEFAULT_PLANNER_DEPLOYMENT,
     DEFAULT_SECONDS,
+    DEFAULT_SORA_MODEL,
     generate_scene_video,
     plan_initial_scene,
     plan_next_scene,
@@ -113,6 +116,7 @@ class ProgressHandle:
     def __post_init__(self) -> None:
         self.use_tqdm = self.use_tqdm and (tqdm is not None)
         if self.use_tqdm:
+            assert tqdm is not None  # for type checkers
             self._bar = tqdm(
                 total=self.total,
                 desc=self.desc,
@@ -241,13 +245,15 @@ def build_tree(
 
 
 def main() -> None:
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY") or DEFAULT_API_KEY
     if not api_key:
-        print("ERROR: OPENAI_API_KEY must be set in the environment.")
+        print(
+            "ERROR: AZURE_OPENAI_API_KEY must be set in the environment or .env file."
+        )
         sys.exit(1)
 
-    planner_model = os.environ.get("PLANNER_MODEL", "gpt-5")
-    sora_model = os.environ.get("SORA_MODEL", "sora-2")
+    planner_model = os.environ.get("PLANNER_MODEL") or DEFAULT_PLANNER_DEPLOYMENT
+    sora_model = os.environ.get("SORA_MODEL") or DEFAULT_SORA_MODEL
     video_size = os.environ.get("VIDEO_SIZE", "1280x720")
 
     nodes_per_preset = sum(3**depth for depth in range(MAX_DEPTH + 1))
