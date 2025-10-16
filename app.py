@@ -1,6 +1,7 @@
 import json
 import mimetypes
 import re
+import os
 import subprocess
 import threading
 import time
@@ -38,7 +39,7 @@ DEFAULT_VIDEO_SIZE = "1280x720"
 DEFAULT_SECONDS = 8
 ALLOWED_SECONDS = [4, 8, 12]
 
-OPENAI_API_BASE = "https://api.openai.com/v1"
+OPENAI_API_BASE = os.getenv("AZURE_OPENAI_API_BASE")  # "https://api.openai.com/v1"
 SORA_VIDEOS_ENDPOINT = f"{OPENAI_API_BASE}/videos"
 RESPONSES_ENDPOINT = f"{OPENAI_API_BASE}/responses"
 
