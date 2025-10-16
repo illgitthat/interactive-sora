@@ -1,4 +1,5 @@
 import json
+import logging
 import mimetypes
 import re
 import os
@@ -43,13 +44,23 @@ ALLOWED_SECONDS = [4, 8, 12]
 AZURE_API_BASE = os.getenv("AZURE_OPENAI_API_BASE", "").rstrip("/")
 AZURE_RESPONSES_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "preview").strip()
 AZURE_VIDEO_API_VERSION = os.getenv(
-    "AZURE_OPENAI_VIDEO_API_VERSION", AZURE_RESPONSES_API_VERSION or "preview"
+    "AZURE_OPENAI_API_VERSION", AZURE_RESPONSES_API_VERSION or "preview"
 ).strip()
 DEFAULT_PLANNER_DEPLOYMENT = (
     os.getenv("AZURE_OPENAI_CHAT_MODEL", "gpt-5-chat").strip() or "gpt-5-chat"
 )
 DEFAULT_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
 DEFAULT_SORA_MODEL = os.getenv("AZURE_OPENAI_SORA_MODEL", "sora-2").strip() or "sora-2"
+
+LOG_LEVEL_NAME = os.getenv("SORA_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+logger = logging.getLogger("interactive_sora")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    logger.addHandler(handler)
+logger.setLevel(getattr(logging, LOG_LEVEL_NAME, logging.INFO))
 
 PLANNER_SYSTEM = """
 You are the Scenario Planner for a Sora-powered choose-your-own-adventure game.
@@ -187,6 +198,13 @@ def responses_create(
     if not deployment:
         raise RuntimeError("Planner model/deployment must be provided")
 
+    logger.info(
+        "Calling Azure Responses API deployment=%s instructions_len=%s input_preview=%s",
+        deployment,
+        len(instructions or ""),
+        (user_input[:120] + "...") if len(user_input) > 120 else user_input,
+    )
+
     candidate_versions = []
     configured_version = (AZURE_RESPONSES_API_VERSION or "preview").strip()
     if configured_version:
@@ -211,6 +229,12 @@ def responses_create(
             break
 
         error_text = response.text
+        logger.error(
+            "Responses API error status=%s version=%s body=%s",
+            response.status_code,
+            version,
+            error_text,
+        )
         if (
             response.status_code == 400
             and "api version not supported" in error_text.lower()
@@ -399,6 +423,11 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def plan_initial_scene(api_key: str, base_prompt: str, model: str) -> dict:
+    logger.info(
+        "Planning initial scene with planner=%s prompt_preview=%s",
+        model,
+        (base_prompt[:200] + "...") if len(base_prompt) > 200 else base_prompt,
+    )
     user_input = f"""
 TASK: Create the opening scene with three choices.
 
@@ -415,6 +444,11 @@ Return JSON with keys: scenario_display, sora_prompt, choices (3).
     scene["_raw_planner_output"] = raw.strip()
     scene["_planner_model"] = model
     scene["_planner_stage"] = "initial"
+    logger.info(
+        "Planner initial scene ready missing_prompt=%s choices=%s",
+        scene.get("_planner_missing_prompt", False),
+        scene.get("choices", []),
+    )
     return scene
 
 
@@ -426,6 +460,12 @@ def plan_next_scene(
     model: str,
 ) -> dict:
     prior_joined = "\n\n---\n\n".join(prior_sora_prompts)
+    logger.info(
+        "Planning next scene with planner=%s choice=%s prior_prompt_count=%s",
+        model,
+        chosen_choice,
+        len(prior_sora_prompts),
+    )
     user_input = f"""
 TASK: Create the next scene with three choices, continuing the story.
 
@@ -450,6 +490,11 @@ Return JSON with keys: scenario_display, sora_prompt, choices (3).
     scene["_raw_planner_output"] = raw.strip()
     scene["_planner_model"] = model
     scene["_planner_stage"] = "continuation"
+    logger.info(
+        "Planner continuation scene ready missing_prompt=%s choices=%s",
+        scene.get("_planner_missing_prompt", False),
+        scene.get("choices", []),
+    )
     return scene
 
 
@@ -514,6 +559,18 @@ def sora_create_video(
 
     # Azure video preview currently expects JSON payloads; input reference continuity is handled in prompt context.
 
+    logger.info(
+        "Submitting Sora job model=%s seconds=%s size=%sx%s",
+        model,
+        seconds,
+        width,
+        height,
+    )
+    logger.debug(
+        "Sora prompt preview: %s",
+        (sora_prompt[:500] + "...") if len(sora_prompt) > 500 else sora_prompt,
+    )
+    start_time = time.time()
     response = requests.post(
         _video_jobs_url(),
         headers=_api_headers(api_key, content_type="application/json"),
@@ -521,10 +578,21 @@ def sora_create_video(
         timeout=600,
     )
     if response.status_code >= 400:
+        logger.error(
+            "Sora create failed status=%s body=%s",
+            response.status_code,
+            response.text,
+        )
         raise RuntimeError(
             f"Sora create failed ({response.status_code}): {response.text}"
         )
-    return response.json()
+    job = response.json()
+    logger.info(
+        "Sora job submitted id=%s latency=%.2fs",
+        job.get("id"),
+        time.time() - start_time,
+    )
+    return job
 
 
 def sora_retrieve_video(api_key: str, video_id: str) -> dict:
@@ -587,14 +655,78 @@ def sora_download_content(
 def sora_poll_until_complete(api_key: str, job: dict) -> dict:
     video = job
     video_id = video["id"]
-    while video.get("status") in ("queued", "in_progress"):
+    pending_statuses = {
+        "queued",
+        "in_progress",
+        "preprocessing",
+        "running",
+        "generating",
+        "starting",
+    }
+    success_statuses = {"completed", "succeeded"}
+    failure_statuses = {"failed", "cancelled", "canceled"}
+
+    last_status = (video.get("status") or "").lower()
+    last_progress = video.get("progress") or video.get("percentage")
+    if last_status:
+        logger.info("Polling Sora job id=%s status=%s", video_id, last_status)
+
+    while True:
+        status = (video.get("status") or "").lower()
+        if status in success_statuses:
+            logger.info("Sora job id=%s reached terminal status=%s", video_id, status)
+            return video
+        if status in failure_statuses:
+            break
+        if status and status not in pending_statuses:
+            logger.warning(
+                "Sora job id=%s encountered unexpected status=%s; continuing to poll",
+                video_id,
+                status,
+            )
+
         time.sleep(2)
         video = sora_retrieve_video(api_key, video_id)
+        status = (video.get("status") or "").lower()
+        progress = video.get("progress") or video.get("percentage")
+        if status != last_status or progress != last_progress:
+            logger.info(
+                "Polling Sora job id=%s status=%s progress=%s",
+                video_id,
+                status,
+                progress,
+            )
+            last_status = status
+            last_progress = progress
 
-    if video.get("status") != "completed":
-        message = (video.get("error") or {}).get("message", f"Job {video_id} failed")
-        raise RuntimeError(message)
-    return video
+    final_status = (video.get("status") or "").lower()
+    error_payload = video.get("error")
+    failure_reason = video.get("failure_reason")
+    logger.error(
+        "Sora job failed id=%s status=%s error=%s failure_reason=%s",
+        video_id,
+        final_status or video.get("status"),
+        error_payload,
+        failure_reason,
+    )
+    detail_parts = [f"Job {video_id} failed"]
+    if failure_reason:
+        detail_parts.append(f"reason={failure_reason}")
+    if isinstance(error_payload, dict):
+        message = error_payload.get("message")
+        code = error_payload.get("code") or error_payload.get("type")
+        inner = error_payload.get("innererror") or error_payload.get("inner_error")
+        if code:
+            detail_parts.append(f"code={code}")
+        if message:
+            detail_parts.append(f"message={message}")
+        if inner:
+            detail_parts.append(f"details={inner}")
+    elif isinstance(error_payload, str):
+        detail_parts.append(error_payload)
+    else:
+        detail_parts.append(str(video))
+    raise RuntimeError("; ".join(detail_parts))
 
 
 def extract_last_frame(video_path: Path, out_image_path: Path) -> Path:
@@ -671,6 +803,12 @@ def generate_scene_video(
 
     last_frame_path = FRAME_DIR / f"{video_id}_last.jpg"
     extract_last_frame(video_path, last_frame_path)
+    logger.info(
+        "Sora job complete id=%s video_path=%s frame_path=%s",
+        video_id,
+        video_path,
+        last_frame_path,
+    )
     return video_id, video_path, last_frame_path
 
 
@@ -777,6 +915,14 @@ def create_session(payload: CreateSessionRequest) -> SessionResponse:
         raise HTTPException(status_code=400, detail="Base prompt is required")
 
     session_id = uuid4().hex
+    logger.info(
+        "Creating session id=%s planner=%s sora=%s size=%s max_steps=%s",
+        session_id,
+        config.planner_model,
+        config.sora_model,
+        config.video_size,
+        config.max_steps,
+    )
     state = SessionState(config=config)
     SESSIONS[session_id] = state
 
@@ -789,14 +935,19 @@ def create_session(payload: CreateSessionRequest) -> SessionResponse:
         story_item = create_story_item(scene)
 
         if not story_item["planner_missing_prompt"]:
-            video_id, video_path, last_frame_path = generate_scene_video(
-                api_key=config.api_key,
-                sora_prompt=story_item["sora_prompt"],
-                model=config.sora_model,
-                size=config.video_size,
-                seconds=DEFAULT_SECONDS,
-                input_reference=None,
-            )
+            logger.info("Session %s requesting initial video", session_id)
+            try:
+                video_id, video_path, last_frame_path = generate_scene_video(
+                    api_key=config.api_key,
+                    sora_prompt=story_item["sora_prompt"],
+                    model=config.sora_model,
+                    size=config.video_size,
+                    seconds=DEFAULT_SECONDS,
+                    input_reference=None,
+                )
+            except Exception:
+                logger.exception("Session %s failed during initial video", session_id)
+                raise
             story_item["video_id"] = video_id
             story_item["video_path"] = str(video_path)
             story_item["last_frame_path"] = str(last_frame_path)
@@ -806,6 +957,7 @@ def create_session(payload: CreateSessionRequest) -> SessionResponse:
         state.story.append(story_item)
     except Exception as exc:
         SESSIONS.pop(session_id, None)
+        logger.exception("Session %s initialization failed: %s", session_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return serialize_session(session_id, state)
@@ -850,6 +1002,15 @@ def advance_story(session_id: str, payload: ChoiceRequest) -> SessionResponse:
         chosen_choice = current["choices"][payload.choice_index]
         state.step_count += 1
 
+        logger.info(
+            "Session %s advancing choice_index=%s choice=%s step=%s/%s",
+            session_id,
+            payload.choice_index,
+            chosen_choice,
+            state.step_count,
+            state.config.max_steps,
+        )
+
         if state.step_count >= state.config.max_steps:
             return serialize_session(session_id, state)
 
@@ -870,14 +1031,21 @@ def advance_story(session_id: str, payload: ChoiceRequest) -> SessionResponse:
                 input_reference = Path(current["last_frame_path"])
 
             if not next_item["planner_missing_prompt"]:
-                video_id, video_path, last_frame_path = generate_scene_video(
-                    api_key=state.config.api_key,
-                    sora_prompt=next_item["sora_prompt"],
-                    model=state.config.sora_model,
-                    size=state.config.video_size,
-                    seconds=DEFAULT_SECONDS,
-                    input_reference=input_reference,
-                )
+                logger.info("Session %s requesting continuation video", session_id)
+                try:
+                    video_id, video_path, last_frame_path = generate_scene_video(
+                        api_key=state.config.api_key,
+                        sora_prompt=next_item["sora_prompt"],
+                        model=state.config.sora_model,
+                        size=state.config.video_size,
+                        seconds=DEFAULT_SECONDS,
+                        input_reference=input_reference,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Session %s failed during continuation video", session_id
+                    )
+                    raise
                 next_item["video_id"] = video_id
                 next_item["video_path"] = str(video_path)
                 next_item["last_frame_path"] = str(last_frame_path)
@@ -886,6 +1054,7 @@ def advance_story(session_id: str, payload: ChoiceRequest) -> SessionResponse:
 
             state.story.append(next_item)
         except Exception as exc:
+            logger.exception("Session %s advance failed: %s", session_id, exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return serialize_session(session_id, state)
