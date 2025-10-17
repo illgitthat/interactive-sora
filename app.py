@@ -37,6 +37,8 @@ FRAME_DIR = Path("sora_cyoa_frames")
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 FRAME_DIR.mkdir(parents=True, exist_ok=True)
 
+PREBAKED_ROOT = Path("prebaked_content")
+
 DEFAULT_VIDEO_SIZE = "1280x720"
 DEFAULT_SECONDS = 8
 ALLOWED_SECONDS = [4, 8, 12]
@@ -74,6 +76,133 @@ if not logger.handlers:
     )
     logger.addHandler(handler)
 logger.setLevel(getattr(logging, LOG_LEVEL_NAME, logging.INFO))
+
+
+@dataclass
+class PrebakedNode:
+    path: Tuple[int, ...]
+    trigger_choice: Optional[str]
+    scenario_display: str
+    sora_prompt: str
+    choices: List[str]
+    video_relpath: Optional[str]
+    poster_relpath: Optional[str]
+    children: List["PrebakedNode"] = field(default_factory=list)
+
+
+@dataclass
+class PrebakedPreset:
+    slug: str
+    base_prompt: str
+    normalized_base_prompt: str
+    root: PrebakedNode
+    nodes_by_path: Dict[Tuple[int, ...], PrebakedNode]
+    max_depth: int
+
+
+def _normalize_prompt(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _prebaked_media_url(relpath: Optional[str]) -> Optional[str]:
+    if not relpath:
+        return None
+    return f"/media/prebaked/{Path(relpath).as_posix()}"
+
+
+def _parse_prebaked_node(data: Dict[str, Any]) -> PrebakedNode:
+    raw_path = data.get("path") or []
+    path = tuple(int(idx) for idx in raw_path)
+    choices_raw = data.get("choices") or []
+    choices = [str(choice) for choice in choices_raw if str(choice).strip()]
+    node = PrebakedNode(
+        path=path,
+        trigger_choice=data.get("triggerChoice"),
+        scenario_display=str(data.get("scenarioDisplay", "")),
+        sora_prompt=str(data.get("soraPrompt", "")),
+        choices=choices,
+        video_relpath=data.get("video"),
+        poster_relpath=data.get("poster"),
+    )
+    children_data = data.get("children") or []
+    node.children = [_parse_prebaked_node(child) for child in children_data]
+    return node
+
+
+def _collect_prebaked_nodes(
+    node: PrebakedNode, mapping: Dict[Tuple[int, ...], PrebakedNode]
+) -> None:
+    mapping[node.path] = node
+    for child in node.children:
+        _collect_prebaked_nodes(child, mapping)
+
+
+def _load_prebaked_presets(
+    root: Path,
+) -> Tuple[Dict[str, PrebakedPreset], Dict[str, PrebakedPreset]]:
+    presets_by_prompt: Dict[str, PrebakedPreset] = {}
+    presets_by_slug: Dict[str, PrebakedPreset] = {}
+    if not root.exists():
+        logger.info("No prebaked presets found at %s", root)
+        return presets_by_prompt, presets_by_slug
+
+    for manifest_path in root.glob("*/manifest.json"):
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            logger.exception("Failed to read prebaked manifest %s", manifest_path)
+            continue
+
+        slug = str(data.get("preset") or manifest_path.parent.name)
+        base_prompt = str(data.get("basePrompt") or "").strip()
+        if not base_prompt:
+            logger.warning(
+                "Skipping prebaked manifest %s because basePrompt is missing",
+                manifest_path,
+            )
+            continue
+
+        tree_data = data.get("tree")
+        if not tree_data:
+            logger.warning(
+                "Skipping prebaked manifest %s because tree data is missing",
+                manifest_path,
+            )
+            continue
+
+        try:
+            root_node = _parse_prebaked_node(tree_data)
+        except Exception:
+            logger.exception("Failed to parse prebaked manifest tree for slug=%s", slug)
+            continue
+
+        nodes_by_path: Dict[Tuple[int, ...], PrebakedNode] = {}
+        _collect_prebaked_nodes(root_node, nodes_by_path)
+        max_depth = max((len(path) for path in nodes_by_path.keys()), default=0)
+        preset = PrebakedPreset(
+            slug=slug,
+            base_prompt=base_prompt,
+            normalized_base_prompt=_normalize_prompt(base_prompt),
+            root=root_node,
+            nodes_by_path=nodes_by_path,
+            max_depth=max_depth,
+        )
+        presets_by_slug[preset.slug] = preset
+        presets_by_prompt[preset.normalized_base_prompt] = preset
+        logger.info(
+            "Loaded prebaked preset slug=%s nodes=%s max_depth=%s",
+            preset.slug,
+            len(nodes_by_path),
+            max_depth,
+        )
+
+    return presets_by_prompt, presets_by_slug
+
+
+PREBAKED_PRESETS_BY_PROMPT, _PREBAKED_PRESETS_BY_SLUG = _load_prebaked_presets(
+    PREBAKED_ROOT
+)
 
 PLANNER_SYSTEM = """
 You are the Scenario Planner for a Sora-powered choose-your-own-adventure game.
@@ -175,6 +304,8 @@ class SessionState:
     story: List[Dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    prebaked_preset_slug: Optional[str] = None
+    prebaked_nodes: Dict[Tuple[int, ...], PrebakedNode] = field(default_factory=dict)
 
 
 SESSIONS: Dict[str, SessionState] = {}
@@ -188,6 +319,12 @@ app.add_middleware(
 )
 app.mount("/media/videos", StaticFiles(directory=str(VIDEO_DIR)), name="videos")
 app.mount("/media/frames", StaticFiles(directory=str(FRAME_DIR)), name="frames")
+if PREBAKED_ROOT.exists():
+    app.mount(
+        "/media/prebaked",
+        StaticFiles(directory=str(PREBAKED_ROOT)),
+        name="prebaked",
+    )
 
 
 def _api_headers(api_key: str, *, content_type: Optional[str] = None) -> Dict[str, str]:
@@ -1067,15 +1204,63 @@ def create_story_item(scene: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def create_prebaked_story_item(node: PrebakedNode) -> Dict[str, Any]:
+    scene_payload = {
+        "scenario_display": node.scenario_display,
+        "sora_prompt": node.sora_prompt,
+        "choices": node.choices,
+        "_planner_missing_prompt": False,
+        "_planner_missing_prompt_reason": "",
+        "_raw_planner_output": "",
+        "_planner_model": "prebaked-manifest",
+        "_planner_stage": "prebaked",
+    }
+    story_item = create_story_item(scene_payload)
+    story_item["prebaked_path"] = node.path
+
+    if node.video_relpath:
+        video_url = _prebaked_media_url(node.video_relpath)
+        if video_url:
+            story_item["video_url_external"] = video_url
+        video_fs_path = PREBAKED_ROOT / Path(node.video_relpath)
+        story_item["prebaked_video_path"] = str(video_fs_path)
+        if not video_fs_path.exists():
+            logger.warning(
+                "Prebaked video missing on disk: slug=%s path=%s",
+                story_item.get("prebaked_path"),
+                video_fs_path,
+            )
+    else:
+        story_item["planner_missing_prompt"] = True
+        story_item["planner_missing_prompt_reason"] = (
+            "Prebaked manifest entry missing video asset."
+        )
+
+    if node.poster_relpath:
+        poster_url = _prebaked_media_url(node.poster_relpath)
+        if poster_url:
+            story_item["poster_url_external"] = poster_url
+        poster_fs_path = PREBAKED_ROOT / Path(node.poster_relpath)
+        story_item["last_frame_path"] = str(poster_fs_path)
+        if not poster_fs_path.exists():
+            logger.warning(
+                "Prebaked poster missing on disk: slug=%s path=%s",
+                story_item.get("prebaked_path"),
+                poster_fs_path,
+            )
+
+    return story_item
+
+
 def build_story_payload(story: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     payload: List[Dict[str, Any]] = []
     for idx, step in enumerate(story, start=1):
-        video_url = None
-        if step.get("video_path"):
+        video_url = step.get("video_url_external")
+        if not video_url and step.get("video_path"):
             video_url = f"/media/videos/{Path(step['video_path']).name}"
 
-        poster_url = None
-        if step.get("last_frame_path"):
+        poster_url = step.get("poster_url_external")
+        if not poster_url and step.get("last_frame_path"):
             poster_url = f"/media/frames/{Path(step['last_frame_path']).name}"
 
         payload.append(
@@ -1145,10 +1330,18 @@ def create_session(payload: CreateSessionRequest) -> SessionResponse:
         max_steps=payload.max_steps,
     )
 
-    if not config.api_key:
-        raise HTTPException(status_code=400, detail="API key is required")
     if not config.base_prompt:
         raise HTTPException(status_code=400, detail="Base prompt is required")
+
+    normalized_prompt = _normalize_prompt(config.base_prompt)
+    prebaked_preset = PREBAKED_PRESETS_BY_PROMPT.get(normalized_prompt)
+
+    if not config.api_key and not prebaked_preset:
+        raise HTTPException(status_code=400, detail="API key is required")
+
+    if prebaked_preset and not config.api_key:
+        capped_steps = max(1, prebaked_preset.max_depth)
+        config.max_steps = min(config.max_steps, capped_steps)
 
     session_id = uuid4().hex
     logger.info(
@@ -1161,6 +1354,19 @@ def create_session(payload: CreateSessionRequest) -> SessionResponse:
     )
     state = SessionState(config=config)
     SESSIONS[session_id] = state
+
+    if prebaked_preset:
+        logger.info(
+            "Session %s using prebaked preset slug=%s (max_depth=%s)",
+            session_id,
+            prebaked_preset.slug,
+            prebaked_preset.max_depth,
+        )
+        state.prebaked_preset_slug = prebaked_preset.slug
+        state.prebaked_nodes = prebaked_preset.nodes_by_path
+        root_item = create_prebaked_story_item(prebaked_preset.root)
+        state.story.append(root_item)
+        return serialize_session(session_id, state)
 
     try:
         scene = plan_initial_scene(
@@ -1234,6 +1440,7 @@ def advance_story(session_id: str, payload: ChoiceRequest) -> SessionResponse:
                 status_code=400, detail="Current scene already has a recorded choice"
             )
 
+        previous_choice_index = current.get("choice_index")
         current["choice_index"] = payload.choice_index
         chosen_choice = current["choices"][payload.choice_index]
         state.step_count += 1
@@ -1246,6 +1453,31 @@ def advance_story(session_id: str, payload: ChoiceRequest) -> SessionResponse:
             state.step_count,
             state.config.max_steps,
         )
+
+        if state.prebaked_nodes and "prebaked_path" in current:
+            current_path = tuple(current.get("prebaked_path") or ())
+            next_path = current_path + (payload.choice_index,)
+            next_node = state.prebaked_nodes.get(next_path)
+            if next_node is not None:
+                logger.info(
+                    "Session %s using prebaked branch path=%s",
+                    session_id,
+                    next_path,
+                )
+                next_item = create_prebaked_story_item(next_node)
+                state.story.append(next_item)
+                return serialize_session(session_id, state)
+
+            if not state.config.api_key:
+                current["choice_index"] = previous_choice_index
+                state.step_count -= 1
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "This branch is not pre-generated. Provide an API key to "
+                        "continue deeper into the story."
+                    ),
+                )
 
         if state.step_count >= state.config.max_steps:
             return serialize_session(session_id, state)

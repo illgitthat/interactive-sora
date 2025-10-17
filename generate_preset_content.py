@@ -84,7 +84,7 @@ PRESETS: Dict[str, str] = {
     ),
 }
 
-MAX_DEPTH = 8  # root (0) + first layer (1) + second layer (2)
+MAX_DEPTH = 3  # root (0) + first layer (1) + second layer (2)
 
 
 def slug_path(path: List[int]) -> str:
