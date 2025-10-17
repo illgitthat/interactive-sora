@@ -4,20 +4,25 @@ import "../styles/config.css";
 const PRESETS = [
   {
     label: "Neon Midnight Walk",
+    slug: "neon_midnight_walk",
     basePrompt:
       "Photorealistic rainy midnight street in a near-future Tokyo district. Camera glides beside a lone figure walking past noodle stalls, holographic billboards, flickering neon reflections in puddles, steam rising from manholes, and curious onlookers in reflective raincoats. Emphasize cinematic lighting, wet asphalt textures, and the sense that anything could emerge from the crowd.",
   },
   {
     label: "Verdant Quest",
+    slug: "verdant_quest",
     basePrompt:
       "Photorealistic enchanted forest adventure at golden hour. Follow an explorer in weathered travel gear trekking through towering moss-covered trees, shafts of light cutting through mist, ancient stone ruins hidden under vines, and distant drumbeats hinting at hidden civilizations. The air feels alive with curiosity and imminent discovery.",
   },
   {
     label: "House of Echoes",
+    slug: "house_of_echoes",
     basePrompt:
       "Photorealistic claustrophobic horror inside a decaying Victorian mansion. The protagonist moves room to room; each doorway reveals a new terror: portraits whose eyes bleed shadows, a nursery of toys that whisper, a dining hall table set for spirits. Lighting is minimal, with handheld flashlight beams and erratic power surges casting unsettling moving silhouettes.",
   },
 ];
+
+const normalizePrompt = (text) => (text || "").replace(/\s+/g, " ").trim().toLowerCase();
 
 const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig }) => {
   const [form, setForm] = useState({
@@ -28,6 +33,7 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig
     basePrompt:
       "A cozy fantasy village at dusk, with glowing lanterns, narrow cobblestone streets, and a mysterious whisper about an ancient forest relic.",
   });
+  const [localError, setLocalError] = useState(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -53,9 +59,21 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig
     return form.apiKey.replace(/.(?=.{4})/g, "·");
   }, [form.apiKey]);
 
+  const prebakedMatch = useMemo(() => {
+    if (!defaultConfig?.prebakedPresets?.length) return null;
+    const normalized = normalizePrompt(form.basePrompt);
+    if (!normalized) return null;
+    return (
+      defaultConfig.prebakedPresets.find(
+        (preset) => preset.normalizedBasePrompt === normalized
+      ) || null
+    );
+  }, [defaultConfig, form.basePrompt]);
+
   const handleChange = (event) => {
     const { name, value } = event.target;
     setForm((prev) => ({ ...prev, [name]: value }));
+    setLocalError(null);
     if (name === "apiKey" && typeof window !== "undefined") {
       window.localStorage.setItem("sora_cyoa_api_key", value);
     }
@@ -63,7 +81,24 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig
 
   const handleSubmit = (event) => {
     event.preventDefault();
-    onSubmit(form);
+    const trimmedKey = (form.apiKey || "").trim();
+    const prebakedReady = Boolean(prebakedMatch && prebakedMatch.hasRootVideo);
+
+    if (!trimmedKey && !prebakedReady) {
+      setLocalError("Provide an OpenAI API key or pick a preset with prebaked footage.");
+      return;
+    }
+
+    setLocalError(null);
+
+    const submission = {
+      ...form,
+      apiKey: trimmedKey,
+      _prebakedSlug: prebakedMatch?.slug || null,
+      _usesPrebaked: prebakedReady,
+    };
+
+    onSubmit(submission);
   };
 
   return (
@@ -86,7 +121,10 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig
                 type="button"
                 className="config-preset"
                 disabled={isSubmitting}
-                onClick={() => setForm((prev) => ({ ...prev, basePrompt: preset.basePrompt }))}
+                onClick={() => {
+                  setForm((prev) => ({ ...prev, basePrompt: preset.basePrompt }));
+                  setLocalError(null);
+                }}
               >
                 <span>{preset.label}</span>
                 <small>Inject prompt</small>
@@ -116,7 +154,6 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig
                     placeholder="sk-..."
                     value={form.apiKey}
                     onChange={handleChange}
-                    required
                     autoComplete="off"
                     spellCheck={false}
                   />
@@ -163,7 +200,20 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl, defaultConfig
                 />
               </label>
 
-              {error && <div className="error-banner">{error}</div>}
+              {prebakedMatch && (
+                <div
+                  className={`info-banner ${prebakedMatch.hasRootVideo ? "ready" : "warning"
+                    }`}
+                >
+                  {prebakedMatch.hasRootVideo
+                    ? `Prebaked scenes detected: ${prebakedMatch.label}. API key optional.`
+                    : `Prebaked preset detected (${prebakedMatch.label}), but source media is missing on disk.`}
+                </div>
+              )}
+
+              {(localError || error) && (
+                <div className="error-banner">{localError || error}</div>
+              )}
 
               <button type="submit" className="launch" disabled={isSubmitting}>
                 {isSubmitting ? "Generating opening scene…" : "Launch cinematic adventure"}

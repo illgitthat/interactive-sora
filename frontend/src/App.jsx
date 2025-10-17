@@ -5,6 +5,8 @@ import ExperienceScreen from "./components/ExperienceScreen.jsx";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 
+const normalizePrompt = (text) => (text || "").replace(/\s+/g, " ").trim().toLowerCase();
+
 const api = axios.create({
   baseURL: API_BASE_URL || undefined,
 });
@@ -37,12 +39,31 @@ const App = () => {
   }, []);
 
   const handleConfigSubmit = async (config) => {
-    setIsSubmitting(true);
     setGlobalError(null);
+
+    const trimmedKey = (config.apiKey || "").trim();
+    const normalizedBasePrompt = normalizePrompt(config.basePrompt);
+    const prebakedMatch =
+      defaultConfig?.prebakedPresets?.find((preset) => {
+        if (!normalizedBasePrompt) return false;
+        if (config._prebakedSlug && preset.slug === config._prebakedSlug) {
+          return true;
+        }
+        return preset.normalizedBasePrompt === normalizedBasePrompt;
+      }) || null;
+
+    if (!trimmedKey && (!prebakedMatch || !prebakedMatch.hasRootVideo)) {
+      setGlobalError(
+        "Provide an OpenAI API key or select a preset that includes prebaked scenes."
+      );
+      return;
+    }
+
+    setIsSubmitting(true);
 
     try {
       const payload = {
-        apiKey: config.apiKey,
+        apiKey: trimmedKey,
         plannerModel: config.plannerModel,
         soraModel: config.soraModel,
         videoSize: config.videoSize,
@@ -56,6 +77,8 @@ const App = () => {
       setHasRemainingSteps(data.hasRemainingSteps);
       setConfigSnapshot({
         ...config,
+        apiKey: trimmedKey,
+        _prebakedSlug: prebakedMatch?.slug || null,
       });
       setPhase("experience");
     } catch (error) {

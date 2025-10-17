@@ -205,6 +205,45 @@ PREBAKED_PRESETS_BY_PROMPT, _PREBAKED_PRESETS_BY_SLUG = _load_prebaked_presets(
     PREBAKED_ROOT
 )
 
+
+def _prebaked_label(slug: str) -> str:
+    cleaned = re.sub(r"[-_]+", " ", slug or "").strip()
+    return cleaned.title() if cleaned else slug
+
+
+def _prebaked_summary_entry(preset: PrebakedPreset) -> Dict[str, Any]:
+    root_video_path: Optional[Path] = None
+    root_poster_path: Optional[Path] = None
+    root_video_exists = False
+    root_poster_exists = False
+
+    if preset.root.video_relpath:
+        root_video_path = PREBAKED_ROOT / Path(preset.root.video_relpath)
+        root_video_exists = root_video_path.exists()
+
+    if preset.root.poster_relpath:
+        root_poster_path = PREBAKED_ROOT / Path(preset.root.poster_relpath)
+        root_poster_exists = root_poster_path.exists()
+
+    return {
+        "slug": preset.slug,
+        "label": _prebaked_label(preset.slug),
+        "basePrompt": preset.base_prompt,
+        "normalizedBasePrompt": preset.normalized_base_prompt,
+        "hasRootVideo": root_video_exists,
+        "hasRootPoster": root_poster_exists,
+        "rootVideoPath": str(root_video_path) if root_video_path else None,
+        "rootPosterPath": str(root_poster_path) if root_poster_path else None,
+    }
+
+
+PREBAKED_PRESETS_SUMMARY: List[Dict[str, Any]] = []
+if _PREBAKED_PRESETS_BY_SLUG:
+    PREBAKED_PRESETS_SUMMARY = [
+        _prebaked_summary_entry(preset)
+        for preset in sorted(_PREBAKED_PRESETS_BY_SLUG.values(), key=lambda p: p.slug)
+    ]
+
 PLANNER_SYSTEM = """
 You are the Scenario Planner for a Sora-powered choose-your-own-adventure game.
 
@@ -1242,6 +1281,7 @@ def default_config() -> Dict[str, Any]:
         "soraModel": DEFAULT_SORA_MODEL,
         "videoSize": DEFAULT_VIDEO_SIZE,
         "maxSteps": 10,
+        "prebakedPresets": [dict(item) for item in PREBAKED_PRESETS_SUMMARY],
     }
 
 
