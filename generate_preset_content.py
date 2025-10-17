@@ -19,7 +19,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app import (
     DEFAULT_API_KEY,
@@ -106,6 +106,46 @@ def copy_assets(
     return video_rel, poster_rel
 
 
+def load_existing_nodes(preset_dir: Path) -> Dict[Tuple[int, ...], Dict[str, Any]]:
+    manifest_path = preset_dir / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+
+    try:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        print(f"  ⚠️ Failed to load existing manifest {manifest_path}: {exc}")
+        return {}
+
+    tree = manifest.get("tree")
+    if not isinstance(tree, dict):
+        return {}
+
+    nodes: Dict[Tuple[int, ...], Dict[str, Any]] = {}
+
+    def visit(node: Dict[str, Any]) -> None:
+        raw_path = node.get("path", [])
+        if isinstance(raw_path, list):
+            try:
+                path_tuple = tuple(int(idx) for idx in raw_path)
+            except (TypeError, ValueError):  # pragma: no cover - malformed manifest
+                path_tuple = tuple()
+        else:
+            path_tuple = tuple()
+
+        nodes[path_tuple] = node
+
+        children = node.get("children", [])
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    visit(child)
+
+    visit(tree)
+    return nodes
+
+
 @dataclass
 class ProgressHandle:
     total: int
@@ -163,27 +203,66 @@ def build_tree(
     trigger_choice: Optional[str],
     parent_last_frame: Optional[Path],
     depth: int,
+    existing_nodes: Dict[Tuple[int, ...], Dict[str, Any]],
 ) -> SceneNode:
-    if depth == 0:
-        scene = plan_initial_scene(
-            api_key=api_key, base_prompt=base_prompt, model=planner_model
-        )
-    else:
-        scene = plan_next_scene(
-            api_key=api_key,
-            base_prompt=base_prompt,
-            prior_sora_prompts=prior_prompts,
-            chosen_choice=trigger_choice or "",
-            model=planner_model,
-        )
-
     node_slug = slug_path(path)
+    node_key = tuple(path)
+
+    existing = existing_nodes.get(node_key)
+    scenario_display = ""
+    sora_prompt = ""
+    choices: List[str] = []
 
     video_relpath: Optional[str] = None
     poster_relpath: Optional[str] = None
     last_frame_path: Optional[Path] = None
 
-    if not scene.get("_planner_missing_prompt"):
+    if existing:
+        scenario_display = str(existing.get("scenarioDisplay", "") or "")
+        sora_prompt = str(existing.get("soraPrompt", "") or "")
+        existing_choices = existing.get("choices", [])
+        if isinstance(existing_choices, list):
+            choices = [str(choice) for choice in existing_choices]
+
+        maybe_video = existing.get("video")
+        maybe_poster = existing.get("poster")
+        if isinstance(maybe_video, str) and isinstance(maybe_poster, str):
+            existing_video = OUTPUT_ROOT / maybe_video
+            existing_poster = OUTPUT_ROOT / maybe_poster
+            if existing_video.exists() and existing_poster.exists():
+                video_relpath = maybe_video
+                poster_relpath = maybe_poster
+                last_frame_path = existing_poster
+
+    need_planning = not scenario_display or not sora_prompt or not choices
+
+    if need_planning:
+        if depth == 0:
+            scene = plan_initial_scene(
+                api_key=api_key, base_prompt=base_prompt, model=planner_model
+            )
+        else:
+            scene = plan_next_scene(
+                api_key=api_key,
+                base_prompt=base_prompt,
+                prior_sora_prompts=prior_prompts,
+                chosen_choice=trigger_choice or "",
+                model=planner_model,
+            )
+        scenario_display = scene["scenario_display"]
+        sora_prompt = scene["sora_prompt"]
+        choices = scene["choices"]
+    else:
+        scene = {
+            "scenario_display": scenario_display,
+            "sora_prompt": sora_prompt,
+            "choices": choices,
+        }
+    generated_new_assets = False
+
+    if not scene.get("_planner_missing_prompt") and (
+        video_relpath is None or poster_relpath is None
+    ):
         video_id, video_path, frame_path = generate_scene_video(
             api_key=api_key,
             sora_prompt=scene["sora_prompt"],
@@ -192,13 +271,13 @@ def build_tree(
             seconds=DEFAULT_SECONDS,
             input_reference=parent_last_frame,
         )
-        # copy into preset directory
         preset_dir = OUTPUT_ROOT / preset_slug
         video_relpath, poster_relpath = copy_assets(
             video_path, frame_path, preset_dir, node_slug
         )
-        last_frame_path = frame_path
-    else:
+        last_frame_path = OUTPUT_ROOT / poster_relpath
+        generated_new_assets = True
+    elif scene.get("_planner_missing_prompt"):
         print(
             f"  ⚠️ planner missing prompt at slug={node_slug}; skipping video generation"
         )
@@ -206,9 +285,9 @@ def build_tree(
     node = SceneNode(
         path=list(path),
         trigger_choice=trigger_choice,
-        scenario_display=scene["scenario_display"],
-        sora_prompt=scene["sora_prompt"],
-        choices=scene["choices"],
+        scenario_display=scenario_display,
+        sora_prompt=sora_prompt,
+        choices=list(choices),
         video_relpath=video_relpath,
         poster_relpath=poster_relpath,
     )
@@ -231,12 +310,15 @@ def build_tree(
                 trigger_choice=choice_text,
                 parent_last_frame=Path(last_frame_path) if last_frame_path else None,
                 depth=depth + 1,
+                existing_nodes=existing_nodes,
             )
             node.children.append(child)
 
     detail = (
         node_slug if trigger_choice is None else f"{node_slug} <- {trigger_choice[:24]}"
     )
+    if existing and not generated_new_assets and video_relpath and poster_relpath:
+        detail += " [cached]"
     preset_tracker.advance(detail)
     overall_detail = f"{preset_slug}:{detail}" if overall_tracker.use_tqdm else ""
     overall_tracker.advance(overall_detail)
@@ -270,6 +352,8 @@ def main() -> None:
             total=nodes_per_preset, desc=preset_slug, position=idx + 1
         )
 
+        existing_nodes = load_existing_nodes(preset_dir)
+
         tree = build_tree(
             api_key=api_key,
             planner_model=planner_model,
@@ -284,6 +368,7 @@ def main() -> None:
             trigger_choice=None,
             parent_last_frame=None,
             depth=0,
+            existing_nodes=existing_nodes,
         )
 
         preset_tracker.close()
