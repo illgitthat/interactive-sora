@@ -539,6 +539,20 @@ def _video_jobs_url(
     return f"{base}?{urlencode(query)}"
 
 
+def _video_generation_content_url(
+    generation_id: str, variant: Optional[str] = None
+) -> str:
+    if not AZURE_API_BASE:
+        raise RuntimeError("AZURE_OPENAI_API_BASE must be configured")
+
+    base = f"{AZURE_API_BASE}/openai/v1/video/generations/{generation_id}/content"
+    if variant:
+        base = f"{base}/{variant}"
+
+    query: Dict[str, str] = {"api-version": AZURE_VIDEO_API_VERSION or "preview"}
+    return f"{base}?{urlencode(query)}"
+
+
 def sora_create_video(
     api_key: str,
     sora_prompt: str,
@@ -629,9 +643,208 @@ def sora_retrieve_video(api_key: str, video_id: str) -> dict:
     raise RuntimeError("Sora retrieve failed after retries: unknown error")
 
 
+def _iter_dicts(obj: Any) -> List[Dict[str, Any]]:
+    stack = [obj]
+    dicts: List[dict] = []
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            dicts.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return dicts
+
+
+def _collect_generation_ids(video: dict, *, job_id: Optional[str] = None) -> List[str]:
+    candidates: List[str] = []
+
+    def _append_if_valid(candidate: Optional[str]) -> None:
+        if not isinstance(candidate, str):
+            return
+        if candidate and candidate != job_id and candidate not in candidates:
+            candidates.append(candidate)
+
+    generations = video.get("generations")
+    if isinstance(generations, list):
+        for entry in generations:
+            if isinstance(entry, dict):
+                _append_if_valid(entry.get("id"))
+
+    output = video.get("output")
+    if isinstance(output, dict):
+        data = output.get("data")
+        if isinstance(data, list):
+            for entry in data:
+                if isinstance(entry, dict):
+                    _append_if_valid(entry.get("id"))
+
+    for entry in _iter_dicts(video):
+        if isinstance(entry, dict):
+            _append_if_valid(entry.get("generation_id"))
+            # Some payloads surface generation identifiers under "asset" records.
+            if entry.get("object") in {"video.generation", "video.asset"}:
+                _append_if_valid(entry.get("id"))
+
+    return candidates
+
+
+def _pick_download_url(video: dict, variant: str) -> Optional[str]:
+    # Scan the job payload for any downloadable asset URLs and prefer the requested variant.
+    variant_lower = (variant or "").lower()
+    candidates: List[Tuple[int, str]] = []
+    for entry in _iter_dicts(video):
+        url = None
+        for key in (
+            "download_url",
+            "downloadUrl",
+            "content_url",
+            "contentUrl",
+            "asset_url",
+            "assetUrl",
+        ):
+            value = entry.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                url = value
+                break
+        if not url:
+            # Accept bare 'url' only if accompanied by asset metadata to avoid noise.
+            if "url" in entry:
+                value = entry.get("url")
+                if (
+                    isinstance(value, str)
+                    and value.startswith("http")
+                    and any(
+                        entry.get(meta_key)
+                        for meta_key in (
+                            "variant",
+                            "asset_type",
+                            "assetType",
+                            "media_type",
+                            "mime_type",
+                            "content_type",
+                            "file_name",
+                            "filename",
+                        )
+                    )
+                ):
+                    url = value
+        if not url:
+            continue
+
+        asset_labels = " ".join(
+            str(entry.get(key, ""))
+            for key in (
+                "variant",
+                "asset_type",
+                "assetType",
+                "type",
+                "purpose",
+                "role",
+                "label",
+            )
+            if entry.get(key) is not None
+        ).lower()
+        media_type = str(
+            entry.get("media_type")
+            or entry.get("mime_type")
+            or entry.get("content_type")
+            or ""
+        ).lower()
+        filename = str(entry.get("file_name") or entry.get("filename") or "").lower()
+
+        priority = 5
+        if variant_lower:
+            if variant_lower == "video":
+                if (
+                    "video" in asset_labels
+                    or "video" in media_type
+                    or filename.endswith((".mp4", ".mov", ".webm", ".mkv"))
+                ):
+                    priority = 0
+            elif (
+                variant_lower in asset_labels
+                or variant_lower in media_type
+                or variant_lower in filename
+            ):
+                priority = 1
+        else:
+            priority = 2
+
+        if priority == 5 and ("video" in asset_labels or "video" in media_type):
+            priority = 1
+
+        candidates.append((priority, url))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def _stream_download(url: str, out_path: Path) -> None:
+    with requests.get(url, stream=True, timeout=1800) as response:
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Sora asset download failed ({response.status_code}): {response.text}"
+            )
+        with open(out_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    handle.write(chunk)
+
+
 def sora_download_content(
-    api_key: str, video_id: str, out_path: Path, variant: str = "video"
+    api_key: str, video: dict, out_path: Path, variant: str = "video"
 ) -> Path:
+    video_id = video.get("id")
+    if not isinstance(video_id, str):
+        raise RuntimeError("Sora download failed: video job missing id")
+
+    direct_url = _pick_download_url(video, variant)
+    if direct_url:
+        logger.info(
+            "Downloading Sora asset via direct URL id=%s variant=%s", video_id, variant
+        )
+        _stream_download(direct_url, out_path)
+        return out_path
+
+    generation_ids = _collect_generation_ids(video, job_id=video_id)
+    for generation_id in generation_ids:
+        try:
+            logger.info(
+                "Downloading Sora asset via generation id=%s variant=%s",
+                generation_id,
+                variant,
+            )
+            url = _video_generation_content_url(generation_id, variant)
+            with requests.get(
+                url,
+                headers=_api_headers(api_key),
+                stream=True,
+                timeout=1800,
+            ) as response:
+                if response.status_code >= 400:
+                    raise RuntimeError(
+                        f"Sora generation download failed ({response.status_code}): {response.text}"
+                    )
+                with open(out_path, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            handle.write(chunk)
+            return out_path
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            logger.warning(
+                "Sora generation download attempt failed job_id=%s generation_id=%s error=%s",
+                video_id,
+                generation_id,
+                exc,
+            )
+
+    logger.info(
+        "Falling back to Sora content endpoint id=%s variant=%s", video_id, variant
+    )
     url = _video_jobs_url(
         job_id=video_id, suffix="content", params={"variant": variant}
     )
@@ -799,7 +1012,7 @@ def generate_scene_video(
     video_id = video["id"]
 
     video_path = VIDEO_DIR / f"{video_id}.mp4"
-    sora_download_content(api_key, video_id, video_path, variant="video")
+    sora_download_content(api_key, video, video_path, variant="video")
 
     last_frame_path = FRAME_DIR / f"{video_id}_last.jpg"
     extract_last_frame(video_path, last_frame_path)
