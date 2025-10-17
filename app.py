@@ -41,6 +41,19 @@ DEFAULT_VIDEO_SIZE = "1280x720"
 DEFAULT_SECONDS = 8
 ALLOWED_SECONDS = [4, 8, 12]
 
+
+def _max_concurrent_jobs() -> int:
+    raw = os.getenv("SORA_MAX_CONCURRENT_VIDEO_JOBS", "2").strip() or "2"
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 2
+    return max(1, value)
+
+
+MAX_CONCURRENT_VIDEO_JOBS = _max_concurrent_jobs()
+VIDEO_JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_VIDEO_JOBS)
+
 AZURE_API_BASE = os.getenv("AZURE_OPENAI_API_BASE", "").rstrip("/")
 AZURE_RESPONSES_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "preview").strip()
 AZURE_VIDEO_API_VERSION = os.getenv(
@@ -999,30 +1012,40 @@ def generate_scene_video(
     input_reference: Optional[Path],
 ) -> Tuple[str, Path, Path]:
     seconds = normalize_seconds(seconds)
-    job = sora_create_video(
-        api_key=api_key,
-        sora_prompt=sora_prompt,
-        model=model,
-        size=size,
-        seconds=seconds,
-        input_reference_path=input_reference,
-    )
-
-    video = sora_poll_until_complete(api_key, job)
-    video_id = video["id"]
-
-    video_path = VIDEO_DIR / f"{video_id}.mp4"
-    sora_download_content(api_key, video, video_path, variant="video")
-
-    last_frame_path = FRAME_DIR / f"{video_id}_last.jpg"
-    extract_last_frame(video_path, last_frame_path)
     logger.info(
-        "Sora job complete id=%s video_path=%s frame_path=%s",
-        video_id,
-        video_path,
-        last_frame_path,
+        "Awaiting Sora job slot current_limit=%s",
+        MAX_CONCURRENT_VIDEO_JOBS,
     )
-    return video_id, video_path, last_frame_path
+    VIDEO_JOB_SEMAPHORE.acquire()
+    logger.info("Sora job slot acquired")
+    try:
+        job = sora_create_video(
+            api_key=api_key,
+            sora_prompt=sora_prompt,
+            model=model,
+            size=size,
+            seconds=seconds,
+            input_reference_path=input_reference,
+        )
+
+        video = sora_poll_until_complete(api_key, job)
+        video_id = video["id"]
+
+        video_path = VIDEO_DIR / f"{video_id}.mp4"
+        sora_download_content(api_key, video, video_path, variant="video")
+
+        last_frame_path = FRAME_DIR / f"{video_id}_last.jpg"
+        extract_last_frame(video_path, last_frame_path)
+        logger.info(
+            "Sora job complete id=%s video_path=%s frame_path=%s",
+            video_id,
+            video_path,
+            last_frame_path,
+        )
+        return video_id, video_path, last_frame_path
+    finally:
+        VIDEO_JOB_SEMAPHORE.release()
+        logger.info("Sora job slot released")
 
 
 def create_story_item(scene: Dict[str, Any]) -> Dict[str, Any]:
