@@ -58,9 +58,10 @@ VIDEO_JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_VIDEO_JOBS)
 
 AZURE_API_BASE = os.getenv("AZURE_OPENAI_API_BASE", "").rstrip("/")
 AZURE_RESPONSES_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "preview").strip()
-AZURE_VIDEO_API_VERSION = os.getenv(
-    "AZURE_OPENAI_API_VERSION", AZURE_RESPONSES_API_VERSION or "preview"
-).strip()
+AZURE_VIDEO_API_VERSION = (
+    os.getenv("AZURE_OPENAI_VIDEO_API_VERSION", "").strip()
+    or os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+)
 DEFAULT_PLANNER_DEPLOYMENT = (
     os.getenv("AZURE_OPENAI_CHAT_MODEL", "gpt-5-chat").strip() or "gpt-5-chat"
 )
@@ -677,29 +678,20 @@ def _video_jobs_url(
     if not AZURE_API_BASE:
         raise RuntimeError("AZURE_OPENAI_API_BASE must be configured")
 
-    base = f"{AZURE_API_BASE}/openai/v1/video/generations/jobs"
+    base = f"{AZURE_API_BASE}/openai/v1/videos"
     if job_id:
         base = f"{base}/{job_id}"
     if suffix:
         base = f"{base}/{suffix}"
 
-    query: Dict[str, str] = {"api-version": AZURE_VIDEO_API_VERSION or "preview"}
+    query: Dict[str, str] = {}
     if params:
         query.update(params)
-    return f"{base}?{urlencode(query)}"
+    if AZURE_VIDEO_API_VERSION:
+        query.setdefault("api-version", AZURE_VIDEO_API_VERSION)
 
-
-def _video_generation_content_url(
-    generation_id: str, variant: Optional[str] = None
-) -> str:
-    if not AZURE_API_BASE:
-        raise RuntimeError("AZURE_OPENAI_API_BASE must be configured")
-
-    base = f"{AZURE_API_BASE}/openai/v1/video/generations/{generation_id}/content"
-    if variant:
-        base = f"{base}/{variant}"
-
-    query: Dict[str, str] = {"api-version": AZURE_VIDEO_API_VERSION or "preview"}
+    if not query:
+        return base
     return f"{base}?{urlencode(query)}"
 
 
@@ -712,13 +704,12 @@ def sora_create_video(
     input_reference_path: Optional[Path] = None,
 ) -> dict:
     width, height = _video_dimensions(size)
+    size_value = f"{width}x{height}"
     payload: Dict[str, Any] = {
-        "prompt": sora_prompt,
         "model": model,
-        "n_variants": 1,
-        "n_seconds": seconds,
-        "width": width,
-        "height": height,
+        "prompt": sora_prompt,
+        "seconds": str(seconds),
+        "size": size_value,
     }
 
     # Azure video preview currently expects JSON payloads; input reference continuity is handled in prompt context.
@@ -804,39 +795,6 @@ def _iter_dicts(obj: Any) -> List[Dict[str, Any]]:
         elif isinstance(current, list):
             stack.extend(current)
     return dicts
-
-
-def _collect_generation_ids(video: dict, *, job_id: Optional[str] = None) -> List[str]:
-    candidates: List[str] = []
-
-    def _append_if_valid(candidate: Optional[str]) -> None:
-        if not isinstance(candidate, str):
-            return
-        if candidate and candidate != job_id and candidate not in candidates:
-            candidates.append(candidate)
-
-    generations = video.get("generations")
-    if isinstance(generations, list):
-        for entry in generations:
-            if isinstance(entry, dict):
-                _append_if_valid(entry.get("id"))
-
-    output = video.get("output")
-    if isinstance(output, dict):
-        data = output.get("data")
-        if isinstance(data, list):
-            for entry in data:
-                if isinstance(entry, dict):
-                    _append_if_valid(entry.get("id"))
-
-    for entry in _iter_dicts(video):
-        if isinstance(entry, dict):
-            _append_if_valid(entry.get("generation_id"))
-            # Some payloads surface generation identifiers under "asset" records.
-            if entry.get("object") in {"video.generation", "video.asset"}:
-                _append_if_valid(entry.get("id"))
-
-    return candidates
 
 
 def _pick_download_url(video: dict, variant: str) -> Optional[str]:
@@ -960,38 +918,6 @@ def sora_download_content(
         logger.info("Direct download URL: %s", direct_url)
         _stream_download(direct_url, out_path)
         return out_path
-
-    generation_ids = _collect_generation_ids(video, job_id=video_id)
-    for generation_id in generation_ids:
-        try:
-            logger.info(
-                "Downloading Sora asset via generation id=%s variant=%s",
-                generation_id,
-                variant,
-            )
-            url = _video_generation_content_url(generation_id, variant)
-            with requests.get(
-                url,
-                headers=_api_headers(api_key),
-                stream=True,
-                timeout=1800,
-            ) as response:
-                if response.status_code >= 400:
-                    raise RuntimeError(
-                        f"Sora generation download failed ({response.status_code}): {response.text}"
-                    )
-                with open(out_path, "wb") as handle:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            handle.write(chunk)
-            return out_path
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            logger.warning(
-                "Sora generation download attempt failed job_id=%s generation_id=%s error=%s",
-                video_id,
-                generation_id,
-                exc,
-            )
 
     logger.info(
         "Falling back to Sora content endpoint id=%s variant=%s", video_id, variant
