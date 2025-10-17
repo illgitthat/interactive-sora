@@ -957,6 +957,7 @@ def sora_download_content(
         logger.info(
             "Downloading Sora asset via direct URL id=%s variant=%s", video_id, variant
         )
+        logger.info("Direct download URL: %s", direct_url)
         _stream_download(direct_url, out_path)
         return out_path
 
@@ -1022,6 +1023,7 @@ def sora_poll_until_complete(api_key: str, job: dict) -> dict:
         "queued",
         "in_progress",
         "preprocessing",
+        "processing",
         "running",
         "generating",
         "starting",
