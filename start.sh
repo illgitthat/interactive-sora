@@ -14,8 +14,7 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip >/dev/null
-python -m pip install -r "$ROOT_DIR/requirements.txt"
+uv sync
 
 deactivate
 

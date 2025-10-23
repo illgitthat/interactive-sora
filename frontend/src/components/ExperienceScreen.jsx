@@ -384,7 +384,7 @@ const ExperienceScreen = ({
                   .padStart(2, "0")}</p>
               )}
               <div className="start-screen__chips">
-                <span className="start-chip">Dynamic Veo Scenes</span>
+                <span className="start-chip">Dynamic Sora Scenes</span>
                 <span className="start-chip">Branching Story Paths</span>
                 <span className="start-chip">Your Decisions Matter</span>
               </div>
@@ -507,18 +507,18 @@ const ApiKeysModal = ({ initialPlanner, initialVideo, onSubmit, onCancel }) => {
       <div className="key-modal">
         <h3>Provide your API keys</h3>
         <p>
-          Keys stay in your browser. Your Gemini key powers Veo renders and Gemini 2.5 Pro planning &
+          Keys stay in your browser. Your Azure OpenAI key powers Sora renders and GPT-5 planning &
           summaries.
         </p>
         <form onSubmit={handleSubmit}>
           <label>
-            <span>Gemini API key (Veo)</span>
+            <span>Azure OpenAI API key (Sora)</span>
             <div className="key-input-row">
               <input
                 type={showVideo ? "text" : "password"}
                 value={video}
                 onChange={(event) => setVideo(event.target.value)}
-                placeholder="AIza..."
+                placeholder="az-..."
                 autoFocus
               />
               <button
@@ -532,7 +532,7 @@ const ApiKeysModal = ({ initialPlanner, initialVideo, onSubmit, onCancel }) => {
           </label>
 
           <label>
-            <span>Planner API key (Gemini 2.5 Pro)</span>
+            <span>Planner API key (Azure OpenAI)</span>
             <div className="key-input-row">
               <input
                 type={showPlanner ? "text" : "password"}

@@ -4,9 +4,9 @@ import ExperienceScreen from "./components/ExperienceScreen.jsx";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 const WORLD_ID = import.meta.env.VITE_WORLD_ID || "default";
-const PLANNER_KEY_STORAGE_KEY = "veo_shared_world_planner_api_key";
-const VIDEO_KEY_STORAGE_KEY = "veo_shared_world_video_api_key";
-const PROGRESS_STORAGE_KEY = `veo_shared_world_progress_${WORLD_ID}`;
+const PLANNER_KEY_STORAGE_KEY = "sora_shared_world_planner_api_key";
+const VIDEO_KEY_STORAGE_KEY = "sora_shared_world_video_api_key";
+const PROGRESS_STORAGE_KEY = `sora_shared_world_progress_${WORLD_ID}`;
 
 const api = axios.create({
   baseURL: API_BASE_URL || undefined,
@@ -28,7 +28,7 @@ const ensurePrefetchBin = () => {
     return prefetchBin;
   }
   prefetchBin = document.createElement("div");
-  prefetchBin.id = "veo-prefetch-bin";
+  prefetchBin.id = "sora-prefetch-bin";
   prefetchBin.style.position = "absolute";
   prefetchBin.style.width = "0";
   prefetchBin.style.height = "0";

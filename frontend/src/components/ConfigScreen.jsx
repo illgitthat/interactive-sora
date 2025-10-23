@@ -19,15 +19,15 @@ const PRESETS = [
   },
 ];
 
-const PLANNER_KEY_STORAGE = "veo_shared_world_planner_api_key";
-const VIDEO_KEY_STORAGE = "veo_shared_world_video_api_key";
+const PLANNER_KEY_STORAGE = "sora_shared_world_planner_api_key";
+const VIDEO_KEY_STORAGE = "sora_shared_world_video_api_key";
 
 const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl }) => {
   const [form, setForm] = useState({
     plannerApiKey: "",
     videoApiKey: "",
-    plannerModel: "gemini-2.5-pro",
-    veoModel: "veo-3.1-generate-preview",
+    plannerModel: "gpt-5-chat",
+    veoModel: "sora-2",
     videoSize: "1280x720",
     basePrompt:
       "A cozy fantasy village at dusk, with glowing lanterns, narrow cobblestone streets, and a mysterious whisper about an ancient forest relic.",
@@ -85,7 +85,7 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl }) => {
       <div className="config-backdrop" />
       <div className="config-inner">
         <section className="config-hero">
-          <p className="config-tag">Veo Control</p>
+          <p className="config-tag">Sora Control</p>
           <h1>
             Dial in your <span>story engine</span>
           </h1>
@@ -122,12 +122,12 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl }) => {
 
             <form onSubmit={handleSubmit}>
               <label className="field">
-                <span>Planner API key (Gemini 2.5 Pro)</span>
+                <span>Planner API key (Azure OpenAI)</span>
                 <div className="masked">
                   <input
                     name="plannerApiKey"
                     type="password"
-                    placeholder="AIza..."
+                    placeholder="az-..."
                     value={form.plannerApiKey}
                     onChange={handleChange}
                     required
@@ -139,12 +139,12 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl }) => {
               </label>
 
               <label className="field">
-                <span>Gemini API key (Veo 3.1)</span>
+                <span>Azure OpenAI API key (Sora)</span>
                 <div className="masked">
                   <input
                     name="videoApiKey"
                     type="password"
-                    placeholder="AIza..."
+                    placeholder="az-..."
                     value={form.videoApiKey}
                     onChange={handleChange}
                     required
@@ -157,20 +157,20 @@ const ConfigScreen = ({ onSubmit, isSubmitting, error, apiBaseUrl }) => {
 
               <div className="field-grid">
                 <label className="field">
-                  <span>Planner model</span>
+                 <span>Planner model</span>
                   <input
                     name="plannerModel"
                     value={form.plannerModel}
                     onChange={handleChange}
-                    placeholder="gemini-2.5-pro"
+                    placeholder="gpt-5-chat"
                     required
                   />
                 </label>
                 <label className="field">
-                  <span>Veo model</span>
+                  <span>Sora model</span>
                   <select name="veoModel" value={form.veoModel} onChange={handleChange}>
-                    <option value="veo-3.1-generate-preview">veo-3.1-generate-preview</option>
-                    <option value="veo-3.1-fast-preview">veo-3.1-fast-preview</option>
+                    <option value="sora-2">sora-2</option>
+                    <option value="sora-2-pro">sora-2-pro</option>
                   </select>
                 </label>
                 <label className="field">

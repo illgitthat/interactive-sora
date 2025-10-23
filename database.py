@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, scoped_session, sessionmaker
 
 
-raw_database_url = os.environ.get("DATABASE_URL", "sqlite:///./veo_world.db")
+raw_database_url = os.environ.get("DATABASE_URL", "sqlite:///./sora_world.db")
 
 # Automatically upgrade legacy PostgreSQL URLs to use the psycopg driver bundled in
 # requirements. This avoids needing the deprecated psycopg2 package at runtime.

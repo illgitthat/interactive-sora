@@ -1,28 +1,27 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
-import os
 import math
+import mimetypes
+import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
-import uuid
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urlparse
 
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, validator
+
 try:
     from pydantic import ConfigDict
 except ImportError:  # pragma: no cover - Pydantic v1 fallback
@@ -43,25 +42,6 @@ from models import (
 from storage import LocalStorageClient, StoredAsset, build_storage_client
 from admin import router as admin_router
 
-try:  # pragma: no cover - optional dependency for Veo
-    from google import genai  # type: ignore
-    from google.genai import types as genai_types  # type: ignore
-except Exception:  # pragma: no cover - allow lazy import errors
-    genai = None
-    genai_types = None
-
-
-def _compute_aspect_ratio(size: str) -> str:
-    try:
-        width_str, height_str = size.lower().split("x", 1)
-        width = int(width_str.strip())
-        height = int(height_str.strip())
-        if width <= 0 or height <= 0:
-            raise ValueError
-        gcd_val = math.gcd(width, height) or 1
-        return f"{width // gcd_val}:{height // gcd_val}"
-    except Exception:
-        return "16:9"
 
 try:
     import cv2  # type: ignore
@@ -75,14 +55,9 @@ try:
 except Exception:  # pragma: no cover
     FFMPEG_BIN = None
 
-APP_TITLE = "Veo Shared World API"
-
+DEFAULT_VIDEO_SIZE = "1280x720"
 DEFAULT_SECONDS = 8
-MAX_CONTEXT_SECONDS = 141.0
-
-GEMINI_API_BASE = os.environ.get(
-    "GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta"
-)
+ALLOWED_SECONDS = (4, 8, 12)
 
 WORLD_ID = os.environ.get("WORLD_ID", "default")
 
@@ -93,79 +68,74 @@ DEFAULT_WORLD_BASE_PROMPT = (
 )
 
 BASE_PROMPT = os.environ.get("WORLD_BASE_PROMPT", DEFAULT_WORLD_BASE_PROMPT)
-DEFAULT_PLANNER_MODEL = "gemini-2.5-pro"
-PLANNER_MODEL = os.environ.get("PLANNER_MODEL", DEFAULT_PLANNER_MODEL)
-VEO_MODEL = os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-preview")
-VIDEO_SIZE = os.environ.get("VIDEO_SIZE", "1280x720")
-VEO_ASPECT_RATIO = _compute_aspect_ratio(VIDEO_SIZE)
+DEFAULT_PLANNER_MODEL = (
+    os.environ.get("AZURE_OPENAI_CHAT_MODEL", "gpt-5-chat").strip() or "gpt-5-chat"
+)
+PLANNER_MODEL = os.environ.get("PLANNER_MODEL", DEFAULT_PLANNER_MODEL).strip()
+SORA_MODEL = os.environ.get("AZURE_OPENAI_SORA_MODEL", "sora-2").strip() or "sora-2"
+VEO_MODEL = SORA_MODEL  # Backwards compatibility for response payloads
+VIDEO_SIZE = (
+    os.environ.get("VIDEO_SIZE", DEFAULT_VIDEO_SIZE).strip() or DEFAULT_VIDEO_SIZE
+)
 SCENE_TIMEOUT_SECONDS = int(os.environ.get("SCENE_TIMEOUT_SECONDS", "900"))
 WATCHDOG_INTERVAL_SECONDS = int(os.environ.get("WATCHDOG_INTERVAL_SECONDS", "60"))
-CONTRIBUTOR_SALT = os.environ.get("CONTRIBUTOR_SALT", "veo-shared-world")
+CONTRIBUTOR_SALT = os.environ.get("CONTRIBUTOR_SALT", "sora-shared-world")
 
-DEFAULT_PROMPT_GUIDANCE = (
-    "\n".join(
-        [
-            "Tone: Cinematic, gritty, high-adrenaline urban combat at dusk. Every scene emphasizes NYC landmarks or recognizable street-level details.",
-            "Movement: Focus on dynamic, first-person action—running, taking cover, firing, reloading—maintaining intensity and realism.",
-            "Environment: Depict NYC authentically but remixed by conflict (smoke, barricades, improvised covers, abandoned cars). Locations should reflect the route from Fidi toward the Upper West Side.",
-            "Objective: Clearly show directional progress toward the Upper West Side with landmarks or street signs indicating northward movement.",
-            "Allies & Foes: Encounters with rival groups, snipers, and unexpected combatants positioned strategically along the route. Highlight tactical maneuvers and exchanges of fire.",
-            "Hook: Each scene ends with a sudden escalation (ambush, unexpected ally arrival, environmental hazard) compelling the next immediate decision or action.",
-            "Checkpoint: Occasionally surface branching choices (alleys, rooftops, subway entrances) as immediate tactical decisions shaping the journey.",
-        ]
-    )
+
+def _max_concurrent_jobs() -> int:
+    raw = os.getenv("SORA_MAX_CONCURRENT_VIDEO_JOBS", "2").strip() or "2"
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 2
+    return max(1, value)
+
+
+MAX_CONCURRENT_VIDEO_JOBS = _max_concurrent_jobs()
+VIDEO_JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_VIDEO_JOBS)
+
+AZURE_API_BASE = os.getenv("AZURE_OPENAI_API_BASE", "").rstrip("/")
+AZURE_RESPONSES_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "preview").strip()
+AZURE_VIDEO_API_VERSION = (
+    os.getenv("AZURE_OPENAI_VIDEO_API_VERSION", "").strip()
+    or os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+)
+DEFAULT_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+APP_TITLE = "Sora Shared World API"
+
+DEFAULT_PROMPT_GUIDANCE = "\n".join(
+    [
+        "Tone: Cinematic, gritty, high-adrenaline urban combat at dusk. Every scene emphasizes NYC landmarks or recognizable street-level details.",
+        "Movement: Focus on dynamic, first-person action—running, taking cover, firing, reloading—maintaining intensity and realism.",
+        "Environment: Depict NYC authentically but remixed by conflict (smoke, barricades, improvised covers, abandoned cars). Locations should reflect the route from Fidi toward the Upper West Side.",
+        "Objective: Clearly show directional progress toward the Upper West Side with landmarks or street signs indicating northward movement.",
+        "Allies & Foes: Encounters with rival groups, snipers, and unexpected combatants positioned strategically along the route. Highlight tactical maneuvers and exchanges of fire.",
+        "Hook: Each scene ends with a sudden escalation (ambush, unexpected ally arrival, environmental hazard) compelling the next immediate decision or action.",
+        "Checkpoint: Occasionally surface branching choices (alleys, rooftops, subway entrances) as immediate tactical decisions shaping the journey.",
+    ]
 )
 
-PROMPT_GUIDANCE = os.environ.get("WORLD_PROMPT_GUIDANCE", "").strip() or DEFAULT_PROMPT_GUIDANCE
-STATE_SUMMARY_MODEL = os.environ.get("STATE_SUMMARY_MODEL", DEFAULT_PLANNER_MODEL).strip()
+PROMPT_GUIDANCE = (
+    os.environ.get("WORLD_PROMPT_GUIDANCE", "").strip() or DEFAULT_PROMPT_GUIDANCE
+)
+STATE_SUMMARY_MODEL = os.environ.get(
+    "STATE_SUMMARY_MODEL", DEFAULT_PLANNER_MODEL
+).strip()
 
-VIDEO_DIR = Path("veo_cyoa_videos")
-FRAME_DIR = Path("veo_cyoa_frames")
+VIDEO_DIR = Path("sora_cyoa_videos")
+FRAME_DIR = Path("sora_cyoa_frames")
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 FRAME_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _ensure_genai_available() -> None:
-    if genai is None or genai_types is None:
-        raise RuntimeError(
-            "google-genai package is required for Veo integration. Install it with 'pip install google-genai'."
-        )
-
-
-def _build_genai_client(api_key: str):
-    _ensure_genai_available()
-    if not api_key:
-        raise RuntimeError("Gemini API key is required")
-    return genai.Client(api_key=api_key)
-
-
-def _resolve_file_download_uri(file_obj: Any) -> str:
-    download_uri = getattr(file_obj, "download_uri", None)
-    if download_uri:
-        logger.debug("[veo] resolved download_uri=%s", download_uri)
-        return download_uri
-    uri = getattr(file_obj, "uri", None)
-    if isinstance(uri, str) and uri.startswith("http"):
-        logger.debug("[veo] resolved http uri=%s", uri)
-        return uri
-    name = getattr(file_obj, "name", None)
-    if isinstance(name, str) and name.startswith("files/"):
-        base = GEMINI_API_BASE.rstrip("/")
-        uri = f"{base}/{name}:download?alt=media"
-        logger.debug("[veo] constructed download uri=%s", uri)
-        return uri
-    raise RuntimeError("Gemini file upload missing download URI")
-
-
 storage_client = build_storage_client()
-logger = logging.getLogger("veo_shared_world")
+LOG_LEVEL_NAME = os.getenv("SORA_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+logger = logging.getLogger("sora_shared_world")
 if not logger.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
-    handler.setFormatter(formatter)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
     logger.addHandler(handler)
-level = logging.getLevelName(os.environ.get("LOG_LEVEL", "INFO"))
-logger.setLevel(level if isinstance(level, int) else logging.INFO)
+logger.setLevel(getattr(logging, LOG_LEVEL_NAME, logging.INFO))
 
 
 def _looks_like_gemini_key(value: str) -> bool:
@@ -195,7 +165,9 @@ app.add_middleware(
 )
 
 if isinstance(storage_client, LocalStorageClient):
-    app.mount("/storage", StaticFiles(directory=storage_client.base_dir), name="storage")
+    app.mount(
+        "/storage", StaticFiles(directory=storage_client.base_dir), name="storage"
+    )
 
 STATIC_DIR = Path("static")
 if not STATIC_DIR.exists():
@@ -222,8 +194,10 @@ class SceneResponse(BaseModel):
     if ConfigDict is not None:
         model_config = ConfigDict(populate_by_name=True)
     else:  # pragma: no cover - Pydantic v1 support
+
         class Config:
             allow_population_by_field_name = True
+
     world_id: str = Field(..., alias="worldId")
     path: str
     depth: int
@@ -252,8 +226,10 @@ class SceneGenerationRequest(BaseModel):
     if ConfigDict is not None:
         model_config = ConfigDict(populate_by_name=True)
     else:  # pragma: no cover - Pydantic v1 support
+
         class Config:
             allow_population_by_field_name = True
+
     path: str = ""
     planner_api_key: Optional[str] = Field(None, alias="plannerApiKey")
     video_api_key: Optional[str] = Field(None, alias="videoApiKey")
@@ -272,8 +248,10 @@ class WorldResponse(BaseModel):
     if ConfigDict is not None:
         model_config = ConfigDict(populate_by_name=True)
     else:  # pragma: no cover - Pydantic v1 support
+
         class Config:
             allow_population_by_field_name = True
+
     world_id: str = Field(..., alias="worldId")
     base_prompt: str = Field(..., alias="basePrompt")
     planner_model: str = Field(..., alias="plannerModel")
@@ -285,8 +263,10 @@ class WorldMetricsResponse(BaseModel):
     if ConfigDict is not None:
         model_config = ConfigDict(populate_by_name=True)
     else:  # pragma: no cover - Pydantic v1 support
+
         class Config:
             allow_population_by_field_name = True
+
     world_id: str = Field(..., alias="worldId")
     scene_count: int = Field(..., alias="sceneCount")
     ready_count: int = Field(..., alias="readyCount")
@@ -368,13 +348,19 @@ def get_world_metrics(world_id: str) -> WorldMetricsResponse:
             select(func.count()).where(Scene.world_id == world_id)
         ).scalar_one()
         ready = session.execute(
-            select(func.count()).where(Scene.world_id == world_id, Scene.status == SceneStatus.READY)
+            select(func.count()).where(
+                Scene.world_id == world_id, Scene.status == SceneStatus.READY
+            )
         ).scalar_one()
         queued = session.execute(
-            select(func.count()).where(Scene.world_id == world_id, Scene.status == SceneStatus.QUEUED)
+            select(func.count()).where(
+                Scene.world_id == world_id, Scene.status == SceneStatus.QUEUED
+            )
         ).scalar_one()
         failed = session.execute(
-            select(func.count()).where(Scene.world_id == world_id, Scene.status == SceneStatus.FAILED)
+            select(func.count()).where(
+                Scene.world_id == world_id, Scene.status == SceneStatus.FAILED
+            )
         ).scalar_one()
         storage_bytes = session.execute(
             select(func.coalesce(func.sum(SceneMetric.storage_bytes), 0))
@@ -407,17 +393,23 @@ def get_scene(world_id: str, path: str = Query("")) -> SceneResponse:
 
 
 @app.post("/worlds/{world_id}/scenes", response_model=SceneResponse)
-def generate_scene_endpoint(world_id: str, payload: SceneGenerationRequest) -> SceneResponse:
+def generate_scene_endpoint(
+    world_id: str, payload: SceneGenerationRequest
+) -> SceneResponse:
     if world_id != WORLD_ID:
         raise HTTPException(status_code=404, detail="World not found")
 
     path = payload.path or ""
     legacy_key = (payload.api_key or "").strip()
     video_api_key = (payload.video_api_key or legacy_key).strip()
-    planner_api_key = _coalesce_planner_key(payload.planner_api_key, video_api_key or legacy_key)
+    planner_api_key = _coalesce_planner_key(
+        payload.planner_api_key, video_api_key or legacy_key
+    )
 
     if not video_api_key:
-        raise HTTPException(status_code=400, detail="Video API key required for generation")
+        raise HTTPException(
+            status_code=400, detail="Video API key required for generation"
+        )
     if not planner_api_key:
         planner_api_key = video_api_key
 
@@ -425,10 +417,14 @@ def generate_scene_endpoint(world_id: str, payload: SceneGenerationRequest) -> S
     with session_scope() as session:
         scene = ensure_scene_exists(session, world_id, path)
         if scene.status == SceneStatus.READY:
-            logger.info("scene already ready world=%s path=%s", world_id, path or "root")
+            logger.info(
+                "scene already ready world=%s path=%s", world_id, path or "root"
+            )
             return build_scene_response(session, scene)
         if scene.status == SceneStatus.QUEUED:
-            logger.info("scene already queued world=%s path=%s", world_id, path or "root")
+            logger.info(
+                "scene already queued world=%s path=%s", world_id, path or "root"
+            )
             return build_scene_response(session, scene)
 
         # pending or failed
@@ -449,7 +445,9 @@ def generate_scene_endpoint(world_id: str, payload: SceneGenerationRequest) -> S
 
 
 @app.post("/worlds/{world_id}/scenes/{path:path}/retry", response_model=SceneResponse)
-def retry_scene(world_id: str, path: str, payload: SceneGenerationRequest) -> SceneResponse:
+def retry_scene(
+    world_id: str, path: str, payload: SceneGenerationRequest
+) -> SceneResponse:
     payload.path = path
     return generate_scene_endpoint(world_id, payload)
 
@@ -489,7 +487,9 @@ def _update_scene_progress(world_id: str, path: str, progress: Optional[int]) ->
         return
     with session_scope() as session:
         scene = (
-            session.execute(select(Scene).where(Scene.world_id == world_id, Scene.path == path))
+            session.execute(
+                select(Scene).where(Scene.world_id == world_id, Scene.path == path)
+            )
             .scalars()
             .first()
         )
@@ -538,12 +538,20 @@ def build_scene_response(session: Session, scene: Scene) -> SceneResponse:
     child_statuses: List[str] = []
     child_paths: List[str] = []
     for idx in range(len(choices) or 3):
-        child = scene.child_path(idx) if hasattr(scene, "child_path") else _child_path(scene.path, idx)
+        child = (
+            scene.child_path(idx)
+            if hasattr(scene, "child_path")
+            else _child_path(scene.path, idx)
+        )
         child_paths.append(child)
         child_scene = (
             session.execute(
-                select(Scene).where(Scene.world_id == scene.world_id, Scene.path == child)
-            ).scalars().first()
+                select(Scene).where(
+                    Scene.world_id == scene.world_id, Scene.path == child
+                )
+            )
+            .scalars()
+            .first()
         )
         if child_scene is None:
             child_statuses.append(SceneStatus.PENDING.value)
@@ -576,7 +584,9 @@ def build_scene_response(session: Session, scene: Scene) -> SceneResponse:
     )
 
 
-def start_generation(world_id: str, path: str, planner_api_key: str, video_api_key: str) -> None:
+def start_generation(
+    world_id: str, path: str, planner_api_key: str, video_api_key: str
+) -> None:
     cancel_event = threading.Event()
     thread = threading.Thread(
         target=_generate_scene,
@@ -584,7 +594,9 @@ def start_generation(world_id: str, path: str, planner_api_key: str, video_api_k
         daemon=True,
         name=f"gen-{world_id}-{path or 'root'}",
     )
-    handle = GenerationHandle(world_id=world_id, path=path, cancel_event=cancel_event, thread=thread)
+    handle = GenerationHandle(
+        world_id=world_id, path=path, cancel_event=cancel_event, thread=thread
+    )
     register_generation(handle)
     logger.info("generation queued world=%s path=%s", world_id, path or "root")
     thread.start()
@@ -610,10 +622,14 @@ def _generate_scene(
                 contributor_hash,
             )
         except SceneCancelled:
-            logger.info("generation cancelled world=%s path=%s", world_id, path or "root")
+            logger.info(
+                "generation cancelled world=%s path=%s", world_id, path or "root"
+            )
             _mark_pending(world_id, path)
         except Exception as exc:
-            logger.exception("generation error world=%s path=%s", world_id, path or "root")
+            logger.exception(
+                "generation error world=%s path=%s", world_id, path or "root"
+            )
             _mark_failed(world_id, path, "generation_error", str(exc))
     finally:
         logger.info("generation finished world=%s path=%s", world_id, path or "root")
@@ -631,7 +647,9 @@ def _generate_scene_inner(
     with session_scope() as session:
         scene = (
             session.execute(
-                select(Scene).where(Scene.world_id == world_id, Scene.path == path).with_for_update()
+                select(Scene)
+                .where(Scene.world_id == world_id, Scene.path == path)
+                .with_for_update()
             )
             .scalars()
             .one()
@@ -647,7 +665,12 @@ def _generate_scene_inner(
 
     planner_result = plan_scene(world_id, path, planner_api_key)
     if planner_result.get("_planner_missing_prompt"):
-        _mark_failed(world_id, path, "planner_missing_prompt", planner_result.get("_planner_missing_prompt_reason", ""))
+        _mark_failed(
+            world_id,
+            path,
+            "planner_missing_prompt",
+            planner_result.get("_planner_missing_prompt_reason", ""),
+        )
         return
 
     if cancel_event.is_set():
@@ -660,7 +683,7 @@ def _generate_scene_inner(
         asset, new_context_seconds, context_video_uri = render_scene_video(
             world_id,
             path,
-            planner_result["veo_prompt"],
+            planner_result.get("sora_prompt") or planner_result["veo_prompt"],
             video_api_key,
             cancel_event,
         )
@@ -689,7 +712,9 @@ def _generate_scene_inner(
     with session_scope() as session:
         scene = (
             session.execute(
-                select(Scene).where(Scene.world_id == world_id, Scene.path == path).with_for_update()
+                select(Scene)
+                .where(Scene.world_id == world_id, Scene.path == path)
+                .with_for_update()
             )
             .scalars()
             .one()
@@ -730,12 +755,16 @@ def _generate_scene_inner(
         )
 
 
-def determine_trigger_choice(session: Session, world_id: str, path: str) -> Optional[str]:
+def determine_trigger_choice(
+    session: Session, world_id: str, path: str
+) -> Optional[str]:
     parent = parent_path(path)
     if parent is None:
         return None
     parent_scene = (
-        session.execute(select(Scene).where(Scene.world_id == world_id, Scene.path == parent))
+        session.execute(
+            select(Scene).where(Scene.world_id == world_id, Scene.path == parent)
+        )
         .scalars()
         .first()
     )
@@ -751,7 +780,9 @@ def determine_trigger_choice(session: Session, world_id: str, path: str) -> Opti
 
 def plan_scene(world_id: str, path: str, api_key: str) -> Dict[str, Any]:
     if not path:
-        result = plan_initial_scene(api_key=api_key, base_prompt=BASE_PROMPT, model=PLANNER_MODEL)
+        result = plan_initial_scene(
+            api_key=api_key, base_prompt=BASE_PROMPT, model=PLANNER_MODEL
+        )
         first_choice = (result.get("choices") or [None])[0]
         result["_chosen_choice"] = first_choice
         result["_state_context"] = []
@@ -761,7 +792,9 @@ def plan_scene(world_id: str, path: str, api_key: str) -> Dict[str, Any]:
             raise RuntimeError("Path has no parent; cannot continue")
         ancestor_paths = ancestor_path_list(path)
         with session_scope() as session:
-            stmt = select(Scene).where(Scene.world_id == world_id, Scene.path.in_(ancestor_paths))
+            stmt = select(Scene).where(
+                Scene.world_id == world_id, Scene.path.in_(ancestor_paths)
+            )
             rows = session.execute(stmt).scalars().all()
         by_path = {row.path: row for row in rows}
         parent = by_path.get(parent_path_value)
@@ -779,7 +812,13 @@ def plan_scene(world_id: str, path: str, api_key: str) -> Dict[str, Any]:
         if idx is None or idx >= len(parent.choices):
             raise RuntimeError("Invalid choice index for path")
         chosen_choice = parent.choices[idx]
-        logger.info("[planner] continue world=%s path=%s choice=%s state_context=%s", world_id, path, chosen_choice, state_context)
+        logger.info(
+            "[planner] continue world=%s path=%s choice=%s state_context=%s",
+            world_id,
+            path,
+            chosen_choice,
+            state_context,
+        )
         result = plan_next_scene(
             api_key=api_key,
             base_prompt=BASE_PROMPT,
@@ -820,13 +859,17 @@ def collect_state_summaries(world_id: str, path: str) -> List[str]:
     with session_scope() as session:
         rows = (
             session.execute(
-                select(Scene).where(Scene.world_id == world_id, Scene.path.in_(ancestor_context))
+                select(Scene).where(
+                    Scene.world_id == world_id, Scene.path.in_(ancestor_context)
+                )
             )
             .scalars()
             .all()
         )
     rows.sort(key=lambda scene: scene.depth)
-    summaries = [row.state_summary for row in rows if getattr(row, "state_summary", None)]
+    summaries = [
+        row.state_summary for row in rows if getattr(row, "state_summary", None)
+    ]
     return summaries
 
 
@@ -851,7 +894,11 @@ def summarise_scene_state(
     if not model or model.lower() == "none":
         return None
 
-    prior_section = "\n".join(f"- {summary}" for summary in prior_summaries) if prior_summaries else "(none yet)"
+    prior_section = (
+        "\n".join(f"- {summary}" for summary in prior_summaries)
+        if prior_summaries
+        else "(none yet)"
+    )
     choices_section = "\n".join(f"- {choice}" for choice in choices)
     user_input = f"""
 WORLD BASE PROMPT (trimmed):
@@ -883,24 +930,23 @@ TASK: Summarise the evolving state using at most three bullets as instructed.
         return None
 
 
-
-
 def render_scene_video(
     world_id: str,
     path: str,
-    veo_prompt: str,
+    sora_prompt: str,
     api_key: str,
     cancel_event: threading.Event,
 ) -> Tuple[StoredAsset, int, Optional[str]]:
     parent_context_path: Optional[Path] = None
-    parent_context_seconds: float = 0.0
     parent_context_uri: Optional[str] = None
     parent = parent_path(path)
     if parent is not None:
         with session_scope() as session:
             parent_scene = (
                 session.execute(
-                    select(Scene).where(Scene.world_id == world_id, Scene.path == parent)
+                    select(Scene).where(
+                        Scene.world_id == world_id, Scene.path == parent
+                    )
                 )
                 .scalars()
                 .first()
@@ -921,184 +967,99 @@ def render_scene_video(
                 variant = "video"
             if source_value:
                 parent_context_path = download_asset(source_value, variant=variant)
-                if isinstance(parent_context_path, Path) and parent_context_path.exists():
-                    logger.info(
-                        "[continuity] context video ready at %s (variant=%s)",
-                        parent_context_path,
-                        variant,
-                    )
-                else:
-                    logger.warning(
-                        "[continuity] failed to obtain context video for world=%s path=%s",
-                        world_id,
-                        path or "root",
-                    )
+                if not (
+                    isinstance(parent_context_path, Path)
+                    and parent_context_path.exists()
+                ):
+                    parent_context_path = None
             stored_total = getattr(parent_scene, "context_video_seconds", None)
             if stored_total is None:
                 stored_total = getattr(parent_scene, "video_seconds", None)
-            if stored_total is not None:
-                parent_context_seconds = float(stored_total)
             parent_context_uri = getattr(parent_scene, "context_video_uri", None)
         else:
-            logger.warning("[continuity] missing parent scene world=%s parent_path=%s", world_id, parent)
-    if parent_context_path and parent_context_path.exists():
-        measured = _video_duration_seconds(parent_context_path)
-        if measured:
-            parent_context_seconds = measured
-            logger.info(
-                "[veo] measured parent context duration=%.2fs path=%s",
-                parent_context_seconds,
-                path,
+            logger.warning(
+                "[continuity] missing parent scene world=%s parent_path=%s",
+                world_id,
+                parent,
             )
-    if parent_context_seconds is None:
-        parent_context_seconds = 0.0
-    if parent_context_seconds > MAX_CONTEXT_SECONDS:
-        logger.error(
-            "[veo] context length exceeded limit seconds=%.2f path=%s",
-            parent_context_seconds,
-            path,
-        )
-        raise RuntimeError(
-            f"Parent context video exceeds Veo's {MAX_CONTEXT_SECONDS}-second limit. Restart from an earlier branch."
-        )
 
-    client = _build_genai_client(api_key)
+    input_reference = None
+    if parent_context_uri:
+        input_reference = parent_context_path
+    elif parent_context_path and parent_context_path.exists():
+        input_reference = parent_context_path
+
     asset: Optional[StoredAsset] = None
-    new_context_seconds = DEFAULT_SECONDS
     context_video_uri: Optional[str] = None
-    uploaded_context_name: Optional[str] = None
+    new_context_seconds = DEFAULT_SECONDS
 
     try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_dir_path = Path(tmp_dir)
-            logger.info(
-                "[veo] starting generation world=%s path=%s with context=%s",
-                world_id,
-                path or "root",
-                bool(parent_context_path),
-            )
-            logger.info(
-                "[veo] input context seconds=%.2f remaining headroom=%.2f",
-                parent_context_seconds,
-                MAX_CONTEXT_SECONDS - parent_context_seconds,
-            )
+        logger.info(
+            "[sora] starting generation world=%s path=%s with context=%s",
+            world_id,
+            path or "root",
+            bool(input_reference),
+        )
+        video_id, video_path, poster_path = generate_scene_video(
+            api_key=api_key,
+            sora_prompt=sora_prompt,
+            model=SORA_MODEL,
+            size=VIDEO_SIZE,
+            seconds=DEFAULT_SECONDS,
+            input_reference=input_reference
+            if isinstance(input_reference, Path)
+            else None,
+        )
+        if cancel_event.is_set():
+            raise SceneCancelled()
 
-            reference_input: Optional[object] = None
-            if parent_context_uri:
-                reference_input = genai_types.File(uri=parent_context_uri)
-            elif parent_context_path and parent_context_path.exists():
-                reference_input = parent_context_path
+        measured_duration = _video_duration_seconds(video_path) or DEFAULT_SECONDS
+        new_context_seconds = int(math.ceil(measured_duration))
 
-            client, operation, uploaded_context_name = veo_create_video(
-                api_key=api_key,
-                veo_prompt=veo_prompt,
-                model=VEO_MODEL,
-                aspect_ratio=VEO_ASPECT_RATIO,
-                seconds=DEFAULT_SECONDS,
-                reference_video=reference_input,
-                client=client,
-            )
-
-            initial_meta = getattr(operation, "metadata", None)
-            if isinstance(initial_meta, dict):
-                _update_scene_progress(world_id, path, initial_meta.get("progressPercent"))
-
-            operation = veo_poll_until_complete(
-                client,
-                operation,
-                cancel_event,
-                progress_callback=lambda prog: _update_scene_progress(world_id, path, prog),
-            )
-            if cancel_event.is_set():
-                raise SceneCancelled()
-
-            sample = _extract_generated_sample(operation)
-            combined_path = tmp_dir_path / "veo_combined.mp4"
-            veo_download_content(client, sample, combined_path)
-
-            combined_duration = _video_duration_seconds(combined_path)
-
-            clip_path = combined_path
-            if parent_context_path is not None:
-                clip_path = tmp_dir_path / "veo_clip.mp4"
-                extract_tail_segment(
-                    combined_path,
-                    DEFAULT_SECONDS,
-                    clip_path,
-                    total_duration=combined_duration,
-                    context_offset=parent_context_seconds,
-                )
-
-            poster_path = tmp_dir_path / "veo_last_frame.jpg"
-            extract_last_frame(combined_path, poster_path)
-
-            if combined_duration:
-                logger.info(
-                    "[veo] combined duration=%.2fs (prev %.2fs + %ss)",
-                    combined_duration,
-                    parent_context_seconds,
-                    DEFAULT_SECONDS,
-                )
-                new_context_seconds = int(math.ceil(combined_duration))
-            else:
-                new_context_seconds = int(math.ceil(parent_context_seconds + DEFAULT_SECONDS))
-                logger.warning(
-                    "[veo] combined duration probe failed; using fallback=%ss",
-                    new_context_seconds,
-                )
-
-            video_node = getattr(sample, "video", None)
-            if video_node is not None:
-                context_video_uri = getattr(video_node, "uri", None) or getattr(video_node, "name", None)
-
-            key_prefix = f"{world_id}/{path or 'root'}"
-            asset = storage_client.upload(
-                clip_path,
-                poster_path,
-                key_prefix=key_prefix,
-                context_video_path=combined_path,
-            )
-            logger.info(
-                "[veo] uploaded asset key_prefix=%s video=%s poster=%s context=%s",
-                key_prefix,
-                asset.video_url,
-                asset.poster_url,
-                asset.context_video_url,
-            )
-            logger.info(
-                "[veo] prepared outputs operation=%s clip=%s poster=%s combined=%s",
-                getattr(operation, "name", None),
-                asset.video_url,
-                asset.poster_url,
-                asset.context_video_url,
-            )
+        key_prefix = f"{world_id}/{path or 'root'}"
+        asset = storage_client.upload(
+            video_path,
+            poster_path,
+            key_prefix=key_prefix,
+            context_video_path=video_path,
+        )
+        logger.info(
+            "[sora] uploaded asset key_prefix=%s video=%s poster=%s context=%s",
+            key_prefix,
+            asset.video_url,
+            asset.poster_url,
+            asset.context_video_url,
+        )
     finally:
         if parent_context_path and parent_context_path.exists():
             parent_context_path.unlink(missing_ok=True)
-        try:
-            if uploaded_context_name is not None:
-                logger.debug("[veo] deleting context upload name=%s", uploaded_context_name)
-                client.files.delete(name=uploaded_context_name)
-        except Exception:
-            logger.debug("[veo] context file deletion skipped", exc_info=True)
 
     if asset is None:
-        raise RuntimeError("Veo generation failed: no asset produced")
+        raise RuntimeError("Sora generation failed: no asset produced")
     return asset, new_context_seconds, context_video_uri
-
 
 
 def download_asset(stored_value: str, variant: str) -> Optional[Path]:
     resolved_url = _resolve_asset_url(stored_value, variant=variant)
     if not resolved_url:
-        logger.warning("[continuity] resolve failed for variant=%s value=%s", variant, stored_value)
+        logger.warning(
+            "[continuity] resolve failed for variant=%s value=%s", variant, stored_value
+        )
         return None
-    logger.info("[continuity] downloading asset variant=%s url=%s", variant, resolved_url)
+    logger.info(
+        "[continuity] downloading asset variant=%s url=%s", variant, resolved_url
+    )
     try:
         response = requests.get(resolved_url, timeout=30)
-        logger.info("[continuity] download status=%s url=%s", response.status_code, resolved_url)
+        logger.info(
+            "[continuity] download status=%s url=%s", response.status_code, resolved_url
+        )
         if response.status_code >= 400:
-            logger.warning("[continuity] download failed status=%s body=%s", response.status_code, response.text[:200])
+            logger.warning(
+                "[continuity] download failed status=%s body=%s",
+                response.status_code,
+                response.text[:200],
+            )
             return None
         parsed = urlparse(resolved_url)
         path_suffix = Path(parsed.path).suffix.lower()
@@ -1131,7 +1092,9 @@ def hash_contributor(api_key: str, path: str) -> str:
 def _mark_pending(world_id: str, path: str) -> None:
     with session_scope() as session:
         scene = (
-            session.execute(select(Scene).where(Scene.world_id == world_id, Scene.path == path))
+            session.execute(
+                select(Scene).where(Scene.world_id == world_id, Scene.path == path)
+            )
             .scalars()
             .first()
         )
@@ -1150,7 +1113,9 @@ def _mark_pending(world_id: str, path: str) -> None:
 def _mark_failed(world_id: str, path: str, code: str, detail: str) -> None:
     with session_scope() as session:
         scene = (
-            session.execute(select(Scene).where(Scene.world_id == world_id, Scene.path == path))
+            session.execute(
+                select(Scene).where(Scene.world_id == world_id, Scene.path == path)
+            )
             .scalars()
             .first()
         )
@@ -1163,7 +1128,13 @@ def _mark_failed(world_id: str, path: str, code: str, detail: str) -> None:
         scene.contributor_hash = None
         scene.progress = None
         scene.progress_updated_at = None
-        logger.warning("scene failed world=%s path=%s code=%s detail=%s", world_id, path or "root", code, detail)
+        logger.warning(
+            "scene failed world=%s path=%s code=%s detail=%s",
+            world_id,
+            path or "root",
+            code,
+            detail,
+        )
 
 
 def _timeout_watchdog() -> None:
@@ -1196,14 +1167,14 @@ def _child_path(path: str, index: int) -> str:
 # === Planner Helpers ===
 
 PLANNER_SYSTEM = """
-You are the Scenario Planner for a Veo 3.1-powered choose-your-own-adventure game.
+You are the Scenario Planner for an Azure OpenAI Sora-powered choose-your-own-adventure game.
 
 Your job:
 - Given a BASE PROMPT (world/tone) or a CONTINUATION (previous scene prompts + the player's chosen action),
 - Produce a JSON object that contains:
   {
     "scenario_display": "A short paragraph (<= 120 words) narrating the current scene to show in the UI.",
-    "veo_prompt": "<A detailed Veo prompt for generating an 8-second extension segment.>",
+    "sora_prompt": "<A detailed Sora prompt for generating an 8-second extension segment.>",
     "choices": ["<choice 1>", "<choice 2>", "<choice 3>"],
     "choices_short": ["<concise choice 1>", "<concise choice 2>", "<concise choice 3>"]
   }
@@ -1211,7 +1182,7 @@ Your job:
 Great Example (match this intensity & structure):
 {
   "scenario_display": "You rocket up the slick fire escape, vault the parapet, and rip a two-round burst that sends the rooftop sniper sliding toward a neon UPTOWN arrow. Drone rotors howl, a stairwell door slams open with a ticking flashbang, and the shard beacon flares cyan over the next roof. Five seconds before they box you in—choose fast.",
-  "veo_prompt": "Context (not visible in video, only for AI guidance): First-person courier sprinting north across Broadway rooftops seconds after breaking taxi cover; rival drone stalking from the east, stairwell squad erupting behind.\nAction 0-2s: Whip right through deli steam, grapple the fire escape, yank it down, and rocket skyward three rungs at a time.\nAction 2-5s: Vault the parapet, skid across rain-slick tar, rip a suppressed double tap that sends the sniper’s rifle skittering past a BROADWAY sign.\nAction 5-8s: Drop into a knee slide toward a glowing UPTOWN ladder as a quadcopter strafes sparks and the stair door detonates showering bolts.\nCamera: Head-cam surges handheld; whip pan left to the sniper hit, then slam low tracking the ladder sprint.\nAudio: Sirens Doppler below, rotor whine screams overhead, flashbang pin clinks, HUD bleeps urgent countdowns.\nFX: Rain beads, muzzle flares, steam bursts, cyan chronoglyph shimmer pulses over the 44th St water tower.\nMomentum North: Drive toward the 44th St tower beacon within 8 seconds before rival scouts seize the shard route.",
+  "sora_prompt": "Context (not visible in video, only for AI guidance): First-person courier sprinting north across Broadway rooftops seconds after breaking taxi cover; rival drone stalking from the east, stairwell squad erupting behind.\nAction 0-2s: Whip right through deli steam, grapple the fire escape, yank it down, and rocket skyward three rungs at a time.\nAction 2-5s: Vault the parapet, skid across rain-slick tar, rip a suppressed double tap that sends the sniper’s rifle skittering past a BROADWAY sign.\nAction 5-8s: Drop into a knee slide toward a glowing UPTOWN ladder as a quadcopter strafes sparks and the stair door detonates showering bolts.\nCamera: Head-cam surges handheld; whip pan left to the sniper hit, then slam low tracking the ladder sprint.\nAudio: Sirens Doppler below, rotor whine screams overhead, flashbang pin clinks, HUD bleeps urgent countdowns.\nFX: Rain beads, muzzle flares, steam bursts, cyan chronoglyph shimmer pulses over the 44th St water tower.\nMomentum North: Drive toward the 44th St tower beacon within 8 seconds before rival scouts seize the shard route.",
   "choices": [
     "Command: Leap the UPTOWN ladder and sprint the water-tower catwalk (Risk: exposed to drone fire; Payoff: seize overwatch on the shard beacon).",
     "Command: Slam the stairwell door shut and plant a flash trap (Risk: CQB slugfest; Payoff: wipe the pursuers and steal their uplink codes).",
@@ -1227,7 +1198,7 @@ Great Example (match this intensity & structure):
 Weak Example (avoid this):
 {
   "scenario_display": "You run beside the bus and shoot at enemies. The bus stops and civilians scream. You must decide what to do next.",
-  "veo_prompt": "Context: You are on Broadway.\nAction 0-2s: Run.\nAction 2-5s: Shoot.\nAction 5-8s: Take cover.\nCamera: Follow the player.\nAudio: City noise.\nFX: Rain.\nMomentum North: Keep going north.",
+  "sora_prompt": "Context: You are on Broadway.\nAction 0-2s: Run.\nAction 2-5s: Shoot.\nAction 5-8s: Take cover.\nCamera: Follow the player.\nAudio: City noise.\nFX: Rain.\nMomentum North: Keep going north.",
   "choices": [
     "Command: Help the civilians.",
     "Command: Keep shooting.",
@@ -1237,7 +1208,7 @@ Weak Example (avoid this):
 }
 
 Rules:
-1) The 'veo_prompt' must be the exact text we send to Veo 3.1 via the Gemini API.
+1) The 'sora_prompt' must be the exact text we send to Azure OpenAI Sora.
    - Begin with "Context (not visible in video, only for AI guidance): ..." to recap continuity and constraints.
    - Follow with the lines below **exactly in this order**, each written as present-tense fragments overflowing with kinetic verbs (vault, crash, rip, rocket, detonate, grapple, etc.). Avoid tame verbs like "move" or "look" unless paired with something explosive.
        * "Action 0-2s: ..."
@@ -1248,7 +1219,7 @@ Rules:
        * "FX: ..."
        * "Momentum North: ..." (explicitly state the next NYC landmark, street, or chronoglyph vector you’re driving toward and how this beat accelerates the courier north within seconds.)
    - Each line must stay ≤ 22 words and jammed with layered sensory detail (motion + location + tactile + objective).
-   - Assume the engine feeds Veo the full prior video, so design seamless momentum across cuts (matching motion, camera, props).
+   - Assume the engine feeds Sora the full prior video, so design seamless momentum across cuts (matching motion, camera, props).
 
 2) Safety & platform constraints (strict):
    - Content must be suitable for audiences under 18.
@@ -1293,68 +1264,6 @@ Rules:
 
 9) Output strictly JSON. No markdown, no commentary, no code fences.
 """.strip()
-
-
-
-def responses_create(api_key: str, model: str, instructions: str, user_input: str) -> str:
-    normalized_model = (model or "").strip() or DEFAULT_PLANNER_MODEL
-
-    contents = [{"role": "user", "parts": [{"text": user_input.strip()}]}]
-    config = None
-    if instructions.strip():
-        if genai_types is None:
-            raise RuntimeError("Gemini client missing type definitions; reinstall google-genai>=0.5.0")
-        config = genai_types.GenerateContentConfig(system_instruction=instructions.strip())
-
-    client = _build_genai_client(api_key)
-    kwargs: Dict[str, Any] = {
-        "model": normalized_model,
-        "contents": contents,
-    }
-    if config is not None:
-        kwargs["config"] = config
-
-    try:
-        response = client.models.generate_content(**kwargs)
-    except Exception as exc:
-        raise RuntimeError(f"Gemini text generation failed: {exc}") from exc
-
-    text = getattr(response, "text", None)
-    if text:
-        return text
-
-    builder: List[str] = []
-
-    def _collect_parts(content_obj: Any) -> None:
-        if content_obj is None:
-            return
-        parts = getattr(content_obj, "parts", None)
-        if parts is None and isinstance(content_obj, dict):
-            parts = content_obj.get("parts")
-        if not parts:
-            return
-        for part in parts:
-            if isinstance(part, dict):
-                part_text = part.get("text") or part.get("output_text")
-            else:
-                part_text = getattr(part, "text", None)
-            if part_text:
-                builder.append(part_text)
-
-    candidates = getattr(response, "candidates", None)
-    if candidates:
-        for candidate in candidates:
-            if isinstance(candidate, dict):
-                _collect_parts(candidate.get("content"))
-            else:
-                _collect_parts(getattr(candidate, "content", None))
-    elif isinstance(response, dict):
-        _collect_parts(response.get("content"))
-
-    if builder:
-        return "".join(builder)
-
-    raise RuntimeError("Gemini text generation returned no text output")
 
 
 def extract_first_json(text: str) -> dict:
@@ -1416,7 +1325,9 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
         parts = [str(item).strip() for item in scenario_display if str(item).strip()]
         scenario_display = " ".join(parts)
     if not scenario_display:
-        scenario_display = "Planner response missing scene description. Adjust your prompt and retry."
+        scenario_display = (
+            "Planner response missing scene description. Adjust your prompt and retry."
+        )
 
     veo_prompt_raw = _pick(veo_prompt_keys)
     veo_prompt_missing = False
@@ -1436,37 +1347,47 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
             veo_prompt_value = "\n".join(lines).strip()
         else:
             veo_prompt_missing = True
-            veo_prompt_missing_reason = "Planner returned prompt dict but it had no usable values."
+            veo_prompt_missing_reason = (
+                "Planner returned prompt dict but it had no usable values."
+            )
             veo_prompt_value = ""
     elif isinstance(veo_prompt_value, list):
-        joined = "\n".join(str(item).strip() for item in veo_prompt_value if str(item).strip())
+        joined = "\n".join(
+            str(item).strip() for item in veo_prompt_value if str(item).strip()
+        )
         if joined:
             veo_prompt_value = joined
         else:
             veo_prompt_missing = True
-            veo_prompt_missing_reason = "Planner returned prompt list but all entries were empty."
+            veo_prompt_missing_reason = (
+                "Planner returned prompt list but all entries were empty."
+            )
             veo_prompt_value = ""
 
     if veo_prompt_value is None:
         veo_prompt_missing = True
         if not veo_prompt_missing_reason:
-            veo_prompt_missing_reason = "Planner response missing recognized Veo prompt field."
+            veo_prompt_missing_reason = (
+                "Planner response missing recognized Sora prompt field."
+            )
         veo_prompt_value = ""
     elif not isinstance(veo_prompt_value, str):
         veo_prompt_value = str(veo_prompt_value).strip()
         if not veo_prompt_value:
             veo_prompt_missing = True
             if not veo_prompt_missing_reason:
-                veo_prompt_missing_reason = "Planner returned non-string prompt that was empty after casting."
+                veo_prompt_missing_reason = (
+                    "Planner returned non-string prompt that was empty after casting."
+                )
     else:
         veo_prompt_value = veo_prompt_value.strip()
         if not veo_prompt_value:
             veo_prompt_missing = True
             if not veo_prompt_missing_reason:
-                veo_prompt_missing_reason = "Planner Veo prompt string was blank."
+                veo_prompt_missing_reason = "Planner Sora prompt string was blank."
 
     veo_prompt = (
-        "Planner response missing Veo prompt details. Please tweak your base prompt or retry."
+        "Planner response missing Sora prompt details. Please tweak your base prompt or retry."
         if veo_prompt_missing
         else veo_prompt_value
     )
@@ -1480,17 +1401,23 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
         choices = [frag.strip(" •-\t").strip() for frag in fragments if frag.strip()]
 
     while len(choices) < 3:
-        choices.append(f"Missing choice {len(choices) + 1}. Update prompt and regenerate.")
+        choices.append(
+            f"Missing choice {len(choices) + 1}. Update prompt and regenerate."
+        )
     if len(choices) > 3:
         choices = choices[:3]
 
     raw_choices_short = _pick(choices_short_keys)
     choices_short: List[str] = []
     if isinstance(raw_choices_short, list):
-        choices_short = [str(choice).strip() for choice in raw_choices_short if str(choice).strip()]
+        choices_short = [
+            str(choice).strip() for choice in raw_choices_short if str(choice).strip()
+        ]
     elif isinstance(raw_choices_short, str):
         fragments = re.split(r"[\n|]", raw_choices_short)
-        choices_short = [frag.strip(" •-\t").strip() for frag in fragments if frag.strip()]
+        choices_short = [
+            frag.strip(" •-\t").strip() for frag in fragments if frag.strip()
+        ]
 
     if choices:
         while len(choices_short) < len(choices):
@@ -1516,21 +1443,27 @@ def normalize_scene_payload(scene: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def plan_initial_scene(api_key: str, base_prompt: str, model: str) -> dict:
-    guidance_section = ""
-    if PROMPT_GUIDANCE:
-        guidance_section = f"\n\nADDITIONAL WORLD GUIDANCE:\n{PROMPT_GUIDANCE}"
-
+    guidance_section = (
+        f"\n\nADDITIONAL WORLD GUIDANCE:\n{PROMPT_GUIDANCE}" if PROMPT_GUIDANCE else ""
+    )
+    logger.info(
+        "Planning initial scene with planner=%s prompt_preview=%s",
+        model,
+        (base_prompt[:200] + "...") if len(base_prompt) > 200 else base_prompt,
+    )
     user_input = f"""
 TASK: Create the opening scene with three choices.
 
 BASE PROMPT:
 {base_prompt}
 
-Shot length: 7 seconds.
-Return JSON with keys: scenario_display, veo_prompt, choices (3), choices_short (3).
+Shot length: 8 seconds.
+Return JSON with keys: scenario_display, sora_prompt, choices (3).
 {guidance_section}
 """.strip()
-    raw = responses_create(api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input)
+    raw = responses_create(
+        api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input
+    )
     scene = normalize_scene_payload(extract_first_json(raw))
     scene["_raw_planner_output"] = raw.strip()
     scene["_planner_model"] = model
@@ -1546,13 +1479,19 @@ def plan_next_scene(
     state_summaries: List[str],
     model: str,
 ) -> dict:
-    prior_joined = "\n\n---\n\n".join(prior_video_prompts) if prior_video_prompts else "(first continuation)"
+    prior_joined = (
+        "\n\n---\n\n".join(prior_video_prompts)
+        if prior_video_prompts
+        else "(first continuation)"
+    )
     state_section = (
         "\n".join(f"- {summary}" for summary in state_summaries)
         if state_summaries
         else "- No prior state summary available yet."
     )
-    guidance_section = f"\n\nADDITIONAL WORLD GUIDANCE:\n{PROMPT_GUIDANCE}" if PROMPT_GUIDANCE else ""
+    guidance_section = (
+        f"\n\nADDITIONAL WORLD GUIDANCE:\n{PROMPT_GUIDANCE}" if PROMPT_GUIDANCE else ""
+    )
 
     user_input = f"""
 TASK: Create the next scene with three choices, continuing the story.
@@ -1560,7 +1499,7 @@ TASK: Create the next scene with three choices, continuing the story.
 BASE PROMPT:
 {base_prompt}
 
-PRIOR VIDEO PROMPTS (in order; each was used to generate an 8s Veo segment):
+PRIOR SORA PROMPTS (in order; each was used to generate an 8s video):
 {prior_joined}
 
 CURRENT STATE SNAPSHOT (bullet list):
@@ -1571,10 +1510,12 @@ PLAYER'S CHOSEN ACTION TO CONTINUE:
 
 Note: The next 8-second segment MUST flow seamlessly from the prior footage, matching character positions, motion vectors, and lighting unless the chosen action forces a justified shift.
 
-Return JSON with keys: scenario_display, veo_prompt, choices (3), choices_short (3).
+Return JSON with keys: scenario_display, sora_prompt, choices (3).
 {guidance_section}
 """.strip()
-    raw = responses_create(api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input)
+    raw = responses_create(
+        api_key=api_key, model=model, instructions=PLANNER_SYSTEM, user_input=user_input
+    )
     scene = normalize_scene_payload(extract_first_json(raw))
     scene["_raw_planner_output"] = raw.strip()
     scene["_planner_model"] = model
@@ -1582,223 +1523,522 @@ Return JSON with keys: scenario_display, veo_prompt, choices (3), choices_short 
     return scene
 
 
-# === Veo Helpers ===
+# === Azure Sora Helpers ===
 
 
-def veo_create_video(
-    api_key: str,
-    veo_prompt: str,
-    model: str,
-    aspect_ratio: str,
-    seconds: int,
-    reference_video: Optional[object] = None,
-    client: Optional[genai.Client] = None,
-):
-    client = client or _build_genai_client(api_key)
-
-    video_arg = None
-    uploaded_context_name: Optional[str] = None
-    if reference_video is not None:
-        if hasattr(reference_video, "uri"):
-            video_arg = reference_video
-            logger.debug("[veo] using existing Gemini file handle for context")
-        elif isinstance(reference_video, Path) and reference_video.exists():
-            upload = client.files.upload(
-                file=str(reference_video),
-                config=genai_types.UploadFileConfig(mime_type="video/mp4"),
-            )
-            uploaded_context_name = getattr(upload, "name", None) if not isinstance(upload, str) else upload
-            fetched = client.files.get(name=uploaded_context_name)
-            video_uri = getattr(fetched, "uri", None) or getattr(fetched, "download_uri", None)
-            if not video_uri:
-                raise RuntimeError("Uploaded reference video missing URI")
-            video_arg = genai_types.Video(uri=video_uri)
-            logger.info(
-                "[veo] uploaded context video name=%s uri=%s",
-                uploaded_context_name,
-                video_uri,
-            )
-        else:
-            logger.warning("[veo] unsupported reference_video type=%s", type(reference_video))
-
-    try:
-        logger.info(
-            "[veo] invoking generate_videos model=%s seconds=%s aspect=%s context=%s",
-            model,
-            seconds,
-            aspect_ratio,
-            bool(video_arg),
-        )
-        logger.debug("[veo] prompt=%s", veo_prompt)
-        operation = client.models.generate_videos(
-            model=model,
-            prompt=veo_prompt,
-            video=video_arg,
-            config=genai_types.GenerateVideosConfig(
-                duration_seconds=seconds,
-                aspect_ratio=aspect_ratio,
-                resolution="720p",
-                number_of_videos=1,
-            ),
-        )
-    except Exception as exc:  # pragma: no cover - upstream errors propagate
-        raise RuntimeError(f"Veo create failed: {exc}") from exc
-
-    logger.info("[veo] generation started operation=%s", getattr(operation, "name", None))
-    return client, operation, uploaded_context_name
+def _api_headers(api_key: str, *, content_type: Optional[str] = None) -> Dict[str, str]:
+    if not api_key:
+        raise RuntimeError("Azure OpenAI API key is required")
+    headers: Dict[str, str] = {"api-key": api_key}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
 
 
-def veo_poll_until_complete(
-    client,
-    operation,
-    cancel_event: threading.Event,
-    progress_callback: Optional[Callable[[Optional[int]], None]] = None,
-):
-    if not getattr(operation, "name", None):
-        raise RuntimeError("Veo response missing operation name")
+def responses_create(
+    api_key: str, model: str, instructions: str, user_input: str
+) -> str:
+    if not AZURE_API_BASE:
+        raise RuntimeError("AZURE_OPENAI_API_BASE must be configured")
 
-    def _progress(meta: Optional[dict]) -> Optional[int]:
-        if not isinstance(meta, dict):
-            return None
-        return meta.get("progressPercent")
+    deployment = (model or DEFAULT_PLANNER_MODEL).strip()
+    if not deployment:
+        raise RuntimeError("Planner model/deployment must be provided")
 
-    if progress_callback:
-        progress_callback(_progress(getattr(operation, "metadata", None)))
-
-    logger.debug(
-        "[veo] entering poll loop operation=%s done=%s",
-        getattr(operation, "name", None),
-        getattr(operation, "done", None),
+    logger.info(
+        "Calling Azure Responses API deployment=%s instructions_len=%s input_preview=%s",
+        deployment,
+        len(instructions or ""),
+        (user_input[:120] + "...") if len(user_input) > 120 else user_input,
     )
 
-    current = operation
-    while not getattr(current, "done", False):
-        if cancel_event.is_set():
-            raise SceneCancelled()
-        time.sleep(3)
-        current = client.operations.get(current)
-        logger.debug(
-            "[veo] polled operation name=%s done=%s error=%s",
-            getattr(current, "name", None),
-            getattr(current, "done", None),
-            getattr(current, "error", None),
+    candidate_versions: List[str] = []
+    configured_version = (AZURE_RESPONSES_API_VERSION or "preview").strip()
+    if configured_version:
+        candidate_versions.append(configured_version)
+    if "preview" not in [version.lower() for version in candidate_versions]:
+        candidate_versions.append("preview")
+
+    headers = _api_headers(api_key, content_type="application/json")
+    payload = {"model": deployment, "instructions": instructions, "input": user_input}
+
+    last_response: Optional[requests.Response] = None
+    for version in candidate_versions:
+        url = f"{AZURE_API_BASE}/openai/v1/responses?api-version={version}"
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
+        if response.status_code < 400:
+            last_response = response
+            break
+        logger.error(
+            "Responses API error status=%s version=%s body=%s",
+            response.status_code,
+            version,
+            response.text[:800],
         )
-        if progress_callback:
-            progress_callback(_progress(getattr(current, "metadata", None)))
+        last_response = response
 
-    if getattr(current, "error", None):
-        error_obj = current.error
-        message = getattr(error_obj, "get", lambda k, default=None: None)("message") if isinstance(error_obj, dict) else getattr(error_obj, "message", None)
-        raise RuntimeError(message or "Veo generation failed")
+    if last_response is None:
+        raise RuntimeError("Responses API request failed with no response captured")
+    if last_response.status_code >= 400:
+        raise RuntimeError(
+            f"Responses API failed ({last_response.status_code}): {last_response.text}"
+        )
 
-    if not getattr(current, "result", None):
-        raise RuntimeError("Veo generation completed without a result payload")
+    try:
+        data = last_response.json()
+    except ValueError as exc:
+        raise RuntimeError("Responses API returned non-JSON payload") from exc
 
-    return current
+    output = data.get("output")
+    if isinstance(output, str) and output.strip():
+        return output
+    if isinstance(output, list):
+        parts: List[str] = []
+        for entry in output:
+            if isinstance(entry, str):
+                parts.append(entry)
+            elif isinstance(entry, dict):
+                text = entry.get("text") or entry.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        if parts:
+            return "\n".join(parts)
 
+    content = data.get("content")
+    if isinstance(content, list):
+        builder: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            entries = item.get("text") or item.get("content") or item.get("parts")
+            if isinstance(entries, list):
+                for part in entries:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("content")
+                        if isinstance(text, str):
+                            builder.append(text)
+                    elif isinstance(part, str):
+                        builder.append(part)
+            elif isinstance(entries, str):
+                builder.append(entries)
+        if builder:
+            return "\n".join(builder)
 
-def _extract_generated_sample(operation) -> Any:
-    result = getattr(operation, "result", None)
-    if not result or not getattr(result, "generated_videos", None):
-        raise RuntimeError("Veo generation returned no samples")
-    return result.generated_videos[0]
-
-
-def veo_download_content(client, sample: Any, out_path: Path) -> Path:
-    video_node = getattr(sample, "video", None)
-    if video_node is None and isinstance(sample, dict):
-        video_node = sample.get("video")
-    if video_node is None:
-        raise RuntimeError("Veo sample missing video payload")
-
-    if hasattr(video_node, "save"):
-        client.files.download(file=video_node)
-        video_node.save(str(out_path))
-        return out_path
-
-    uri = getattr(video_node, "uri", None)
-    if uri is None and isinstance(video_node, dict):
-        uri = video_node.get("uri")
-
-    if uri:
-        logger.debug("[veo] downloading video content from uri=%s", uri)
-        with requests.get(uri, stream=True, timeout=1800) as response:
-            if response.status_code >= 400:
-                raise RuntimeError(f"Veo download failed ({response.status_code}): {response.text}")
-            with out_path.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        fh.write(chunk)
-        return out_path
-
-    video_bytes = getattr(video_node, "video_bytes", None)
-    if video_bytes is None and isinstance(video_node, dict):
-        video_bytes = video_node.get("encodedVideo") or video_node.get("videoBytes")
-        if isinstance(video_bytes, str):
-            video_bytes = base64.b64decode(video_bytes)
-
-    if not video_bytes:
-        raise RuntimeError("Veo sample missing downloadable content")
-
-    out_path.write_bytes(video_bytes if isinstance(video_bytes, (bytes, bytearray)) else bytes(video_bytes))
-    logger.debug("[veo] wrote inline video bytes to %s (%s bytes)", out_path, out_path.stat().st_size)
-    return out_path
+    raise RuntimeError("Responses API returned no textual output")
 
 
-def extract_tail_segment(
-    video_path: Path,
-    seconds: int,
-    out_path: Path,
-    *,
-    total_duration: Optional[float] = None,
-    context_offset: Optional[float] = None,
-) -> Path:
-    if seconds <= 0:
-        raise ValueError("seconds must be positive")
-    if FFMPEG_BIN is None:
-        raise RuntimeError("FFmpeg is required to trim Veo output but was not found.")
+def _guess_mime(path: Path) -> str:
+    mime = mimetypes.guess_type(str(path))[0]
+    return mime or "application/octet-stream"
 
-    duration = total_duration if total_duration is not None else _video_duration_seconds(video_path)
-    if duration is None:
-        duration = (context_offset or 0.0) + float(seconds)
 
-    # Determine when the new segment starts inside the stitched clip.
-    baseline_start = max(duration - float(seconds), 0.0)
-    if context_offset is not None:
-        baseline_start = max(min(context_offset, duration), baseline_start)
-
-    # Clamp within media bounds and pad slightly so we never underrun.
-    start_time = max(min(baseline_start, max(duration - 0.01, 0.0)), 0.0)
-    trim_length = max(min(duration - start_time, float(seconds) + 0.05), 0.05)
-
-    cmd = [
-        FFMPEG_BIN,
-        "-y",
-        "-ss",
-        f"{start_time:.3f}",
-        "-i",
-        str(video_path),
-        "-t",
-        f"{trim_length:.3f}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
-        "-shortest",
-        str(out_path),
+def _video_dimensions(size: str) -> Tuple[int, int]:
+    try:
+        width_str, height_str = size.lower().split("x", 1)
+        width = int(width_str)
+        height = int(height_str)
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        pass
+    fallback_width, fallback_height = [
+        int(val) for val in DEFAULT_VIDEO_SIZE.split("x")
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return fallback_width, fallback_height
+
+
+def _video_jobs_url(
+    *,
+    job_id: Optional[str] = None,
+    suffix: Optional[str] = None,
+    params: Optional[Dict[str, str]] = None,
+) -> str:
+    if not AZURE_API_BASE:
+        raise RuntimeError("AZURE_OPENAI_API_BASE must be configured")
+
+    base = f"{AZURE_API_BASE}/openai/v1/videos"
+    if job_id:
+        base = f"{base}/{job_id}"
+    if suffix:
+        base = f"{base}/{suffix}"
+
+    query: Dict[str, str] = {}
+    if params:
+        query.update(params)
+    if AZURE_VIDEO_API_VERSION:
+        query.setdefault("api-version", AZURE_VIDEO_API_VERSION)
+
+    if not query:
+        return base
+    return f"{base}?{urlencode(query)}"
+
+
+def sora_create_video(
+    api_key: str,
+    sora_prompt: str,
+    model: str,
+    size: str,
+    seconds: int,
+    input_reference_path: Optional[Path] = None,
+) -> dict:
+    width, height = _video_dimensions(size)
+    payload: Dict[str, Any] = {
+        "model": model,
+        "prompt": sora_prompt,
+        "seconds": str(seconds),
+        "size": f"{width}x{height}",
+    }
+    if input_reference_path and input_reference_path.exists():
+        try:
+            with input_reference_path.open("rb") as handle:
+                payload["input_video"] = {
+                    "data": handle.read(),
+                    "filename": input_reference_path.name,
+                    "mime_type": _guess_mime(input_reference_path),
+                }
+        except Exception:
+            logger.warning(
+                "Failed to include input reference video for continuity", exc_info=True
+            )
+
+    logger.info(
+        "Submitting Sora job model=%s seconds=%s size=%sx%s",
+        model,
+        seconds,
+        width,
+        height,
+    )
+    logger.debug(
+        "Sora prompt preview: %s",
+        (sora_prompt[:500] + "...") if len(sora_prompt) > 500 else sora_prompt,
+    )
+    response = requests.post(
+        _video_jobs_url(),
+        headers=_api_headers(api_key, content_type="application/json"),
+        json=payload,
+        timeout=600,
+    )
+    if response.status_code >= 400:
+        logger.error(
+            "Sora create failed status=%s body=%s",
+            response.status_code,
+            response.text,
+        )
+        raise RuntimeError(
+            f"Sora create failed ({response.status_code}): {response.text}"
+        )
+    job = response.json()
+    logger.info("Sora job submitted id=%s", job.get("id"))
+    return job
+
+
+def sora_retrieve_video(api_key: str, video_id: str) -> dict:
+    url = _video_jobs_url(job_id=video_id)
+    last_error: Optional[Exception] = None
+    for attempt in range(5):
+        try:
+            response = requests.get(url, headers=_api_headers(api_key), timeout=120)
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(min(2**attempt, 8))
+            continue
+
+        if response.status_code >= 500 or response.status_code in (429, 520):
+            last_error = RuntimeError(
+                f"Sora retrieve failed ({response.status_code}): {response.text[:200]}"
+            )
+            time.sleep(min(2**attempt, 8))
+            continue
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Sora retrieve failed ({response.status_code}): {response.text}"
+            )
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            last_error = exc
+            time.sleep(min(2**attempt, 8))
+
+    if last_error:
+        raise RuntimeError(f"Sora retrieve failed after retries: {last_error}")
+    raise RuntimeError("Sora retrieve failed after retries: unknown error")
+
+
+def sora_poll_until_complete(api_key: str, job: dict) -> dict:
+    video = job
+    video_id = video["id"]
+    pending_statuses = {
+        "queued",
+        "in_progress",
+        "preprocessing",
+        "processing",
+        "running",
+        "generating",
+        "starting",
+    }
+    success_statuses = {"completed", "succeeded"}
+    failure_statuses = {"failed", "cancelled", "canceled"}
+
+    last_status = (video.get("status") or "").lower()
+    last_progress = video.get("progress") or video.get("percentage")
+    if last_status:
+        logger.info("Polling Sora job id=%s status=%s", video_id, last_status)
+
+    while True:
+        status = (video.get("status") or "").lower()
+        if status in success_statuses:
+            logger.info("Sora job id=%s reached terminal status=%s", video_id, status)
+            return video
+        if status in failure_statuses:
+            break
+        if status and status not in pending_statuses:
+            logger.warning(
+                "Sora job id=%s encountered unexpected status=%s; continuing to poll",
+                video_id,
+                status,
+            )
+
+        time.sleep(2)
+        video = sora_retrieve_video(api_key, video_id)
+        status = (video.get("status") or "").lower()
+        progress = video.get("progress") or video.get("percentage")
+        if status != last_status or progress != last_progress:
+            logger.info(
+                "Polling Sora job id=%s status=%s progress=%s",
+                video_id,
+                status,
+                progress,
+            )
+            last_status = status
+            last_progress = progress
+
+    final_status = (video.get("status") or "").lower()
+    error_payload = video.get("error")
+    failure_reason = video.get("failure_reason")
+    logger.error(
+        "Sora job failed id=%s status=%s error=%s failure_reason=%s",
+        video_id,
+        final_status or video.get("status"),
+        error_payload,
+        failure_reason,
+    )
+    detail_parts = [f"Job {video_id} failed"]
+    if failure_reason:
+        detail_parts.append(f"reason={failure_reason}")
+    if isinstance(error_payload, dict):
+        message = error_payload.get("message")
+        code = error_payload.get("code") or error_payload.get("type")
+        inner = error_payload.get("innererror") or error_payload.get("inner_error")
+        if code:
+            detail_parts.append(f"code={code}")
+        if message:
+            detail_parts.append(f"message={message}")
+        if inner:
+            detail_parts.append(f"details={inner}")
+    elif isinstance(error_payload, str):
+        detail_parts.append(error_payload)
+    else:
+        detail_parts.append(str(video))
+    raise RuntimeError("; ".join(detail_parts))
+
+
+def _iter_dicts(obj: Any) -> List[Dict[str, Any]]:
+    stack = [obj]
+    collected: List[dict] = []
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            collected.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return collected
+
+
+def _pick_download_url(video: dict, variant: str) -> Optional[str]:
+    variant_lower = (variant or "").lower()
+    candidates: List[Tuple[int, str]] = []
+    for entry in _iter_dicts(video):
+        url = None
+        for key in (
+            "download_url",
+            "downloadUrl",
+            "content_url",
+            "contentUrl",
+            "asset_url",
+            "assetUrl",
+        ):
+            value = entry.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                url = value
+                break
+        if not url and "url" in entry:
+            value = entry.get("url")
+            if (
+                isinstance(value, str)
+                and value.startswith("http")
+                and any(
+                    entry.get(meta_key)
+                    for meta_key in (
+                        "variant",
+                        "asset_type",
+                        "assetType",
+                        "media_type",
+                        "mime_type",
+                        "content_type",
+                        "file_name",
+                        "filename",
+                    )
+                )
+            ):
+                url = value
+        if not url:
+            continue
+
+        asset_labels = " ".join(
+            str(entry.get(key, ""))
+            for key in (
+                "variant",
+                "asset_type",
+                "assetType",
+                "type",
+                "purpose",
+                "role",
+                "label",
+            )
+            if entry.get(key) is not None
+        ).lower()
+        media_type = str(
+            entry.get("media_type")
+            or entry.get("mime_type")
+            or entry.get("content_type")
+            or ""
+        ).lower()
+        filename = str(entry.get("file_name") or entry.get("filename") or "").lower()
+
+        priority = 5
+        if variant_lower:
+            if variant_lower == "video":
+                if (
+                    "video" in asset_labels
+                    or "video" in media_type
+                    or filename.endswith((".mp4", ".mov", ".webm", ".mkv"))
+                ):
+                    priority = 0
+            elif (
+                variant_lower in asset_labels
+                or variant_lower in media_type
+                or variant_lower in filename
+            ):
+                priority = 1
+        else:
+            priority = 2
+
+        if priority == 5 and ("video" in asset_labels or "video" in media_type):
+            priority = 1
+
+        candidates.append((priority, url))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def _stream_download(url: str, out_path: Path) -> None:
+    with requests.get(url, stream=True, timeout=1800) as response:
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Sora asset download failed ({response.status_code}): {response.text}"
+            )
+        with out_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    handle.write(chunk)
+
+
+def sora_download_content(
+    api_key: str, video: dict, out_path: Path, variant: str = "video"
+) -> Path:
+    video_id = video.get("id")
+    if not isinstance(video_id, str):
+        raise RuntimeError("Sora download failed: video job missing id")
+
+    direct_url = _pick_download_url(video, variant)
+    if direct_url:
+        logger.info(
+            "Downloading Sora asset via direct URL id=%s variant=%s", video_id, variant
+        )
+        logger.debug("Direct download URL: %s", direct_url)
+        _stream_download(direct_url, out_path)
+        return out_path
+
+    logger.info(
+        "Falling back to Sora content endpoint id=%s variant=%s", video_id, variant
+    )
+    url = _video_jobs_url(
+        job_id=video_id, suffix="content", params={"variant": variant}
+    )
+    with requests.get(
+        url,
+        headers=_api_headers(api_key),
+        stream=True,
+        timeout=1800,
+    ) as response:
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Sora download failed ({response.status_code}): {response.text}"
+            )
+        with out_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    handle.write(chunk)
     return out_path
+
+
+def generate_scene_video(
+    api_key: str,
+    sora_prompt: str,
+    model: str,
+    size: str,
+    seconds: int,
+    input_reference: Optional[Path],
+) -> Tuple[str, Path, Path]:
+    seconds = normalize_seconds(seconds)
+    logger.info("Awaiting Sora job slot current_limit=%s", MAX_CONCURRENT_VIDEO_JOBS)
+    VIDEO_JOB_SEMAPHORE.acquire()
+    logger.info("Sora job slot acquired")
+    try:
+        job = sora_create_video(
+            api_key=api_key,
+            sora_prompt=sora_prompt,
+            model=model,
+            size=size,
+            seconds=seconds,
+            input_reference_path=input_reference,
+        )
+
+        video = sora_poll_until_complete(api_key, job)
+        video_id = video["id"]
+
+        video_path = VIDEO_DIR / f"{video_id}.mp4"
+        sora_download_content(api_key, video, video_path, variant="video")
+
+        last_frame_path = FRAME_DIR / f"{video_id}_last.jpg"
+        extract_last_frame(video_path, last_frame_path)
+        logger.info(
+            "Sora job complete id=%s video_path=%s frame_path=%s",
+            video_id,
+            video_path,
+            last_frame_path,
+        )
+        return video_id, video_path, last_frame_path
+    finally:
+        VIDEO_JOB_SEMAPHORE.release()
+        logger.info("Sora job slot released")
 
 
 def _video_duration_seconds(path: Path) -> Optional[float]:
@@ -1833,7 +2073,9 @@ def _video_duration_seconds(path: Path) -> Optional[float]:
             if output:
                 for line in output.splitlines():
                     if "Duration:" in line:
-                        duration_token = line.split("Duration:", 1)[1].split(",", 1)[0].strip()
+                        duration_token = (
+                            line.split("Duration:", 1)[1].split(",", 1)[0].strip()
+                        )
                         h, m, s = duration_token.split(":")
                         return int(h) * 3600 + int(m) * 60 + float(s)
         except Exception:
@@ -1880,103 +2122,9 @@ def extract_last_frame(video_path: Path, out_image_path: Path) -> Path:
         if out_image_path.exists():
             return out_image_path
 
-    raise RuntimeError("Failed to extract last frame: OpenCV/FFmpeg unavailable or video unreadable.")
-
-
-
-def generate_scene_video(
-    api_key: str,
-    veo_prompt: str,
-    model: str,
-    aspect_ratio: str,
-    seconds: int,
-    context_video: Optional[Path],
-) -> Tuple[str, Path, Path, Path, Optional[str]]:
-    seconds = normalize_seconds(seconds)
-
-    context_seconds = 0.0
-    if context_video is not None and context_video.exists():
-        measured = _video_duration_seconds(context_video)
-        if measured:
-            context_seconds = measured
-    if context_seconds > MAX_CONTEXT_SECONDS:
-        raise RuntimeError(
-            f"Context video exceeds Veo's {MAX_CONTEXT_SECONDS}-second limit (got {context_seconds:.2f}s)."
-        )
-
-    client, operation, uploaded_context_name = veo_create_video(
-        api_key=api_key,
-        veo_prompt=veo_prompt,
-        model=model,
-        aspect_ratio=aspect_ratio,
-        seconds=seconds,
-        reference_video=context_video,
+    raise RuntimeError(
+        "Failed to extract last frame: OpenCV/FFmpeg unavailable or video unreadable."
     )
-    operation = veo_poll_until_complete(client, operation, threading.Event())
-    sample = _extract_generated_sample(operation)
-    logger.info(
-        "[veo] generation completed operation=%s samples=%s",
-        getattr(operation, "name", None),
-        len(getattr(getattr(operation, "result", None), "generated_videos", []) or []),
-    )
-
-    token = uuid.uuid4().hex
-    combined_path = VIDEO_DIR / f"{token}_combined.mp4"
-    veo_download_content(client, sample, combined_path)
-
-    combined_duration = _video_duration_seconds(combined_path)
-
-    clip_path = VIDEO_DIR / f"{token}.mp4"
-    if context_video is not None:
-        logger.debug(
-            "[veo] trimming clip seconds=%s combined=%s -> clip=%s",
-            seconds,
-            combined_path,
-            clip_path,
-        )
-        extract_tail_segment(
-            combined_path,
-            seconds,
-            clip_path,
-            total_duration=combined_duration,
-            context_offset=context_seconds,
-        )
-    else:
-        shutil.copy2(combined_path, clip_path)
-
-    poster_path = FRAME_DIR / f"{token}_last.jpg"
-    extract_last_frame(combined_path, poster_path)
-
-    operation_name = getattr(operation, "name", None) or token
-
-    if combined_duration:
-        logger.info(
-            "[veo] combined duration for preset op=%s is %.2fs",
-            operation_name,
-            combined_duration,
-        )
-    video_node = getattr(sample, "video", None)
-    context_video_uri = None
-    if video_node is not None:
-        context_video_uri = getattr(video_node, "uri", None) or getattr(video_node, "name", None)
-
-    try:
-        if uploaded_context_name is not None:
-            logger.debug("[veo] deleting context upload name=%s", uploaded_context_name)
-            client.files.delete(name=uploaded_context_name)
-    except Exception:
-        logger.debug("[veo] preset context file deletion skipped", exc_info=True)
-
-    logger.info(
-        "[veo] prepared outputs operation=%s clip=%s poster=%s combined=%s",
-        operation_name,
-        clip_path,
-        poster_path,
-        combined_path,
-    )
-    return operation_name, clip_path, poster_path, combined_path, context_video_uri
-
-
 
 
 if __name__ == "__main__":
