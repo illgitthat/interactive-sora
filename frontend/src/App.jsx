@@ -253,13 +253,19 @@ const App = () => {
     async (path, keys) => {
       const trimmedPlanner = keys?.plannerApiKey?.trim?.() || "";
       const trimmedVideo = keys?.videoApiKey?.trim?.() || "";
-      if (!trimmedVideo) {
-        throw new Error("Gemini API key required for video generation.");
-      }
       setIsGenerating(true);
       setGlobalError(null);
       try {
-        const { data: kickoff } = await api.post(`/worlds/${WORLD_ID}/scenes`, {
+        const payload = { path };
+        if (trimmedPlanner) {
+          payload.plannerApiKey = trimmedPlanner;
+        } else if (trimmedVideo) {
+          payload.plannerApiKey = trimmedVideo;
+        }
+        if (trimmedVideo) {
+          payload.videoApiKey = trimmedVideo;
+        }
+        const { data: kickoff } = await api.post(`/worlds/${WORLD_ID}/scenes`, payload);
           path,
           plannerApiKey: trimmedPlanner || trimmedVideo,
           videoApiKey: trimmedVideo,
@@ -321,12 +327,26 @@ const App = () => {
 
       if (!videoApiKey) {
         setPendingChoice({ index: choiceIndex, path: childPath });
-        setShowKeyModal(true);
-        return;
+        try {
+          await ensureSceneReady(childPath, { plannerApiKey, videoApiKey });
+          setPendingChoice(null);
+          return;
+        } catch (error) {
+          const message = error.response?.data?.detail || error.message || error.toString();
+          if (message.toLowerCase().includes("key")) {
+            setGlobalError(null);
+            setShowKeyModal(true);
+            return;
+          }
+          setGlobalError(message);
+          setPendingChoice(null);
+          return;
+        }
       }
 
       try {
         await ensureSceneReady(childPath, { plannerApiKey, videoApiKey });
+        setPendingChoice(null);
       } catch (error) {
         const message = error.response?.data?.detail || error.message || error.toString();
         setGlobalError(message);
@@ -375,18 +395,19 @@ const App = () => {
   const handlePromptForKey = useCallback(
     async (path) => {
       if (typeof path === "string") {
-        if (videoApiKey) {
-          try {
-            await ensureSceneReady(path, { plannerApiKey, videoApiKey });
+        try {
+          await ensureSceneReady(path, { plannerApiKey, videoApiKey });
+          return;
+        } catch (error) {
+          const message = error.response?.data?.detail || error.message || error.toString();
+          if (message.toLowerCase().includes("key")) {
+            setPendingChoice({ index: null, path });
+            setShowKeyModal(true);
             return;
-          } catch (error) {
-            const message = error.response?.data?.detail || error.message || error.toString();
-            setGlobalError(message);
           }
+          setGlobalError(message);
         }
-        setPendingChoice({ index: null, path });
       }
-      setShowKeyModal(true);
     },
     [ensureSceneReady, plannerApiKey, videoApiKey]
   );

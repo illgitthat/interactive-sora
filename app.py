@@ -138,21 +138,10 @@ if not logger.handlers:
 logger.setLevel(getattr(logging, LOG_LEVEL_NAME, logging.INFO))
 
 
-def _looks_like_gemini_key(value: str) -> bool:
-    if not value:
-        return False
-    gemini_prefixes = ("AIza", "AI", "gk-", "gw-")
-    return any(value.startswith(prefix) for prefix in gemini_prefixes)
-
-
 def _coalesce_planner_key(planner_key: str, fallback_key: str) -> str:
     key = (planner_key or "").strip()
-    if key and _looks_like_gemini_key(key):
+    if key:
         return key
-    if key and not _looks_like_gemini_key(key):
-        logger.info(
-            "[planner] supplied planner key does not resemble a Gemini key; falling back to video key"
-        )
     return (fallback_key or "").strip()
 
 
@@ -401,15 +390,17 @@ def generate_scene_endpoint(
 
     path = payload.path or ""
     legacy_key = (payload.api_key or "").strip()
-    video_api_key = (payload.video_api_key or legacy_key).strip()
-    planner_api_key = _coalesce_planner_key(
-        payload.planner_api_key, video_api_key or legacy_key
-    )
-
+    video_api_key = payload.video_api_key or legacy_key or DEFAULT_API_KEY
+    video_api_key = video_api_key.strip()
     if not video_api_key:
         raise HTTPException(
-            status_code=400, detail="Video API key required for generation"
+            status_code=400,
+            detail="Video API key required for generation",
         )
+    planner_api_key = _coalesce_planner_key(
+        payload.planner_api_key,
+        video_api_key or DEFAULT_API_KEY,
+    )
     if not planner_api_key:
         planner_api_key = video_api_key
 
