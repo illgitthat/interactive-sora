@@ -266,10 +266,6 @@ const App = () => {
           payload.videoApiKey = trimmedVideo;
         }
         const { data: kickoff } = await api.post(`/worlds/${WORLD_ID}/scenes`, payload);
-          path,
-          plannerApiKey: trimmedPlanner || trimmedVideo,
-          videoApiKey: trimmedVideo,
-        });
         if (kickoff.status === "ready") {
           updateStoryWithScene(kickoff);
           return;

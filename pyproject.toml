@@ -19,6 +19,7 @@ dependencies = [
     "argon2-cffi",
     "itsdangerous",
     "jinja2",
+    "python-multipart",
 ]
 [dependency-groups]
 dev = [
