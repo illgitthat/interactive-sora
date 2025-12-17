@@ -4,6 +4,11 @@
 .env.*
 .vscode/
 *.log
+.ruff_cache/
+
+# Lockfiles we don't commit
+package-lock.json
+frontend/package-lock.json
 
 # Python build artifacts
 __pycache__/
@@ -30,6 +35,8 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 .pnpm-debug.*
+bun.lockb
+
 
 # Project generated media/content
 sora_cyoa_frames/

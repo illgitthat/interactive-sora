@@ -7,6 +7,12 @@ PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="$ROOT_DIR/.venv"
 BACKEND_HOST="0.0.0.0"
 BACKEND_PORT="8000"
+BUN_BIN="${BUN:-bun}"
+
+if ! command -v "$BUN_BIN" >/dev/null 2>&1; then
+  echo "bun is required but not installed. Install bun and retry." >&2
+  exit 1
+fi
 
 # Create virtual environment if missing and install backend dependencies.
 if [ ! -d "$VENV_DIR" ]; then
@@ -18,13 +24,13 @@ uv sync
 
 deactivate
 
-# Install frontend dependencies (npm ci if lockfile exists, otherwise npm install)
+# Install frontend dependencies with bun (respect bun.lock when present)
 if [ -d "$ROOT_DIR/frontend" ]; then
   pushd "$ROOT_DIR/frontend" >/dev/null
-  if [ -f package-lock.json ]; then
-    npm ci
+  if [ -f bun.lock ]; then
+    "$BUN_BIN" install --frozen-lockfile
   else
-    npm install
+    "$BUN_BIN" install
   fi
   popd >/dev/null
 fi
@@ -37,7 +43,7 @@ uvicorn app:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload &
 BACKEND_PID=$!
 
 pushd "$ROOT_DIR/frontend" >/dev/null
-npm run dev -- --host &
+"$BUN_BIN" run dev -- --host &
 FRONTEND_PID=$!
 popd >/dev/null
 
